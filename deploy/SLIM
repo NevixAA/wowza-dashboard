@@ -1,0 +1,2 @@
+This tree is the SLIM dashboard deployment. Its presence switches on
+dashboard_data/remote_mirror.py (data downloaded from v9's public raw URLs).

@@ -1,0 +1,398 @@
+"""
+Model training, calibration, and evaluation.
+
+Two models trained and ensembled:
+  1. LogisticRegression         (fast, interpretable baseline)
+  2. GradientBoostingClassifier (primary — best single-model performance)
+
+Both are calibrated with isotonic regression (cv='prefit') on the test split.
+Train/test split is strictly chronological — no shuffling, no leakage.
+
+Ensemble: simple average of both calibrated models' probabilities.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import pickle
+import sys
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, log_loss, roc_auc_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import config
+
+log = logging.getLogger(__name__)
+
+
+# ── Calibrated model wrapper (module-level so pickle works) ───────────────────
+
+class _CalibratedModel:
+    """Wraps a sklearn Pipeline + Platt scaling (sigmoid) calibrator.
+    Platt scaling uses LogisticRegression on raw probabilities — regularized,
+    no overfit risk on small calibration sets (unlike IsotonicRegression).
+    """
+    def __init__(self, pipe, calibrator):
+        self._pipe       = pipe
+        self._calibrator = calibrator
+
+    def predict_proba(self, X):
+        raw = self._pipe.predict_proba(X)[:, 1].reshape(-1, 1)
+        cal = self._calibrator.predict_proba(raw)[:, 1]
+        cal = np.clip(cal, 0.001, 0.999)
+        return np.column_stack([1 - cal, cal])
+
+
+# ── Feature columns ───────────────────────────────────────────────────────────
+FEATURE_COLS = [
+    # Rolling form
+    "home_scored_last5",    "away_scored_last5",
+    "home_conceded_last5",  "away_conceded_last5",
+    "home_over25_last5",    "away_over25_last5",
+    # Strength vs league
+    "home_attack_str",      "away_attack_str",
+    "home_defense_str",     "away_defense_str",
+    # Match context
+    "home_advantage",       "away_home_adv_factor",
+    "home_rest_days",       "away_rest_days",
+    # Set piece proxies — rolling historical averages (match-day actuals removed)
+    "home_corners_pg_roll", "away_corners_pg_roll",
+    "home_fouls_pg_roll",   "away_fouls_pg_roll",
+    "combined_sot_ratio",
+    # xG and inside-box shots (API-Football cache; NaN for standard leagues → median-imputed)
+    "home_xg_last5",        "away_xg_last5",
+    "home_insidebox_last5", "away_insidebox_last5",
+    # Season-to-date venue splits — complements last-5 with full-season tendencies
+    "home_season_goals_h",    "away_season_goals_a",
+    "home_season_conceded_h", "away_season_conceded_a",
+    "home_cs_rate_h",         "away_cs_rate_a",
+    # Dropped: referee_foul_avg, *_sp_goals_pg, *_pen_goals_pg, *_fk_goals_pg
+    # All had 0% importance in both LR and GBM — pure noise (ML audit 2026-06-10)
+    # Half-time rolling form (only populated for standard-format leagues)
+    "home_ht_scored_last5",   "away_ht_scored_last5",
+    "home_ht_conceded_last5", "away_ht_conceded_last5",
+    "home_ht_attack_str",     "away_ht_attack_str",
+    "combined_ht_goals_avg",
+    # HT tendency rates (% of recent games with HT goal)
+    "home_ht_over05_rate",    "away_ht_over05_rate",
+    "home_ht_over15_rate",    "away_ht_over15_rate",
+    # Market microstructure
+    "bookmaker_overround",    # over-round tightness signals market confidence
+    "p_over25_poisson_dc",    # Dixon-Coles corrected Poisson P(over 2.5)
+    # Phase 5: Formation / lineup features (from /fixtures/lineups, TTL 2h)
+    "home_attack_formation",    # starting formation attacking intent 0-1
+    "away_attack_formation",
+    "combined_attack_intent",   # sum of both — overall match attacking expectation
+    "home_forward_count",       # confirmed forwards in starting XI
+    "away_forward_count",
+    # Phase 6: Head-to-head history (from /fixtures/headtohead, TTL 168h)
+    "h2h_over25_rate",          # % of last 10 H2H matches that ended over 2.5
+    "h2h_avg_goals",            # avg goals per game in last 10 H2H
+    "h2h_home_win_rate",        # % of last 10 H2H won by the home team
+    # Phase 7: API-Football cross-validated odds (Bet365 via /odds, TTL 6h)
+    "api_implied_over25",       # Bet365 implied P(over 2.5) — second bookmaker signal
+    "api_overround",            # Bet365 overround — market tightness / confidence proxy
+    # Phase 7 extensions — additional Bet365 market signals (same /odds call)
+    "api_implied_btts",          # Bet365 implied P(BTTS) — independent O/U signal
+    "api_implied_over35",        # Bet365 implied P(over 3.5) — high-scoring confirmation
+    "api_implied_over15",        # Bet365 implied P(over 1.5) — defensive match signal
+    "api_implied_draw",          # Bet365 implied P(draw) — draw prob correlates with under
+    # Phase 9 — Season stage (from /fixtures/rounds, TTL 24h)
+    "season_stage_ratio",        # current_round / total_rounds: late-season pressure
+    "is_late_season",            # binary: stage_ratio >= 0.80
+    # Phase 10 — Coach stability (from /coachs, TTL 7d)
+    "home_coach_is_caretaker",   # binary: coach tenure < 14 days
+    "away_coach_is_caretaker",
+    # Rolling possession and blocked shots (from fixture stats backfill)
+    "home_possession_last5",     # avg ball possession % home team last 5 matches
+    "away_possession_last5",
+    "home_blocked_last5",        # avg blocked shots last 5
+    "away_blocked_last5",
+    # Pitch type — artificial turf suppresses goals (Finland/Sweden/Norway)
+    "home_pitch_artificial",
+]
+
+
+def _prep(df: pd.DataFrame, feat_cols: list[str] = None) -> tuple[pd.DataFrame, list[str]]:
+    """Select and impute feature columns."""
+    cols = [c for c in (feat_cols or FEATURE_COLS) if c in df.columns]
+    X = df[cols].copy().apply(pd.to_numeric, errors="coerce")
+    col_medians = X.median().fillna(0.0)
+    X = X.fillna(col_medians)
+    return X, cols
+
+
+# ── Training ──────────────────────────────────────────────────────────────────
+
+def train(
+    df: pd.DataFrame,
+    target: str = "over25",
+    train_ratio: float = 0.8,
+    sample_weight=None,
+    feature_cols: "list[str] | None" = None,
+) -> dict:
+    """
+    Train on the chronological training split, calibrate on the test split.
+    sample_weight: array-like of per-row weights (time-decay etc.), same length as df.
+    Returns dict: {model_name: {"model", "metrics", "feature_cols"}}
+    """
+    import numpy as np
+    df = df.dropna(subset=[target]).copy().sort_values("date").reset_index(drop=True)
+    split   = int(len(df) * train_ratio)
+    train_df = df.iloc[:split]
+    test_df  = df.iloc[split:]
+
+    # feature_cols=None -> full FEATURE_COLS (standard model, unchanged). A caller can pass a
+    # reduced list (e.g. the new-format model drops features that are populated at train but
+    # absent at predict, which _prep would otherwise impute to 0.0 and the scaler would blow up).
+    X_train, feat_cols = _prep(train_df, feature_cols)
+    X_test,  _         = _prep(test_df, feat_cols)
+    y_train = train_df[target].values
+    y_test  = test_df[target].values
+
+    # Align sample weights to the sorted/reset df
+    if sample_weight is not None:
+        w_all = np.array(sample_weight)[df.index] if len(sample_weight) == len(df) else \
+                np.ones(len(df))
+        w_train = w_all[:split]
+    else:
+        w_train = None
+
+    # Hold out last 15% of train for calibration (still chronological, no leakage)
+    cal_split  = int(len(X_train) * 0.85)
+    X_fit, y_fit = X_train.iloc[:cal_split], y_train[:cal_split]
+    X_cal, y_cal = X_train.iloc[cal_split:], y_train[cal_split:]
+    w_fit = w_train[:cal_split] if w_train is not None else None
+    w_cal = w_train[cal_split:] if w_train is not None else None
+
+    models_cfg = [
+        ("logistic", LogisticRegression(max_iter=2000, C=0.5, solver="lbfgs")),
+        ("gradient_boost", GradientBoostingClassifier(
+            n_estimators=300, max_depth=4, learning_rate=0.05,
+            subsample=0.8, min_samples_leaf=20, random_state=42,
+        )),
+    ]
+
+    # LightGBM as 3rd ensemble member — leaf-wise growth, ~10× faster than GBM
+    try:
+        from lightgbm import LGBMClassifier
+        models_cfg.append(("lightgbm", LGBMClassifier(
+            n_estimators=200, learning_rate=0.05, max_depth=6,
+            num_leaves=31, subsample=0.8, colsample_bytree=0.8,
+            min_child_samples=20, random_state=42, verbose=-1,
+            n_jobs=-1,
+        )))
+    except ImportError:
+        pass
+
+    results = {}
+    for name, base_clf in models_cfg:
+        pipe = Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf",    base_clf),
+        ])
+        fit_params = {}
+        if w_fit is not None:
+            fit_params["clf__sample_weight"] = w_fit
+        pipe.fit(X_fit, y_fit, **fit_params)
+
+        # Platt scaling calibration (sigmoid) on cal split — regularized, no overfit risk
+        # Replaces IsotonicRegression which overfits on small cal sets (<300 samples)
+        raw_proba_cal = pipe.predict_proba(X_cal)[:, 1].reshape(-1, 1)
+        platt = LogisticRegression(C=1.0, max_iter=1000)
+        platt.fit(raw_proba_cal, y_cal,
+                  sample_weight=w_cal if w_cal is not None else None)
+
+        calibrated = _CalibratedModel(pipe, platt)
+
+        proba = calibrated.predict_proba(X_test)[:, 1]
+        metrics = {
+            "accuracy":  round(accuracy_score(y_test, proba >= 0.5), 4),
+            "auc":       round(roc_auc_score(y_test, proba), 4),
+            "log_loss":  round(log_loss(y_test, proba), 5),
+            "n_train":   int(len(X_fit)),
+            "n_cal":     int(len(X_cal)),
+            "n_test":    int(len(X_test)),
+        }
+        log.info(
+            f"  {name:20s}  acc={metrics['accuracy']:.3f}"
+            f"  auc={metrics['auc']:.3f}  logloss={metrics['log_loss']:.4f}"
+        )
+        results[name] = {
+            "model":        calibrated,
+            "metrics":      metrics,
+            "feature_cols": feat_cols,
+        }
+
+    # ── Meta-logistic learned ensemble blend ─────────────────────────────────
+    # Fit on the test split: base model predictions → logistic → final probability.
+    # The test split was never seen by any base model, so there is no leakage.
+    if len(results) >= 2:
+        try:
+            meta_X = np.column_stack([
+                results[n]["model"].predict_proba(X_test)[:, 1] for n in results
+            ])
+            meta_clf = LogisticRegression(C=1.0, max_iter=500, solver="lbfgs")
+            meta_clf.fit(meta_X, y_test)
+            meta_proba = meta_clf.predict_proba(meta_X)[:, 1]
+            log.info(
+                f"  {'meta_logistic':20s}  "
+                f"auc={round(roc_auc_score(y_test, meta_proba), 4):.3f}"
+            )
+            results["__meta__"] = {
+                "model":        meta_clf,
+                "metrics":      {},
+                "feature_cols": list(results.keys()),
+            }
+        except Exception as e:
+            log.warning(f"Meta-logistic training failed, falling back to mean: {e}")
+
+    return results
+
+
+# ── Persistence ───────────────────────────────────────────────────────────────
+
+def save_models(results: dict, target: str = "over25",
+                model_file: Optional[Path] = None) -> None:
+    """Write a trained payload to `model_file` — NEVER to a serving model file.
+
+    Since 2026-10-25 the serving files (config.MODEL_FILE_*, HT_MODEL_FILE_*) are written only by
+    src/promotion_gate.py, so a research or one-off script cannot silently change what serves.
+    """
+    path = Path(model_file) if model_file else config.MODEL_FILE
+    serving = {Path(p).resolve() for p in (
+        config.MODEL_FILE_STANDARD, config.MODEL_FILE_NEWFORMAT, config.MODEL_FILE_BTTS,
+        config.MODEL_FILE_OVER15, config.MODEL_FILE_OVER35, config.HT_MODEL_FILE_05,
+        config.HT_MODEL_FILE_15)}
+    if path.resolve() in serving:
+        raise PermissionError(f"{path.name} is a SERVING model file; only src/promotion_gate.py "
+                              f"may write it (submit the candidate to the gate instead)")
+    payload = {
+        "target":       target,
+        "models":       {k: v["model"] for k, v in results.items()},
+        "feature_cols": results[next(iter(results))]["feature_cols"],
+        "metrics":      {k: v["metrics"] for k, v in results.items()},
+    }
+    with open(path, "wb") as f:
+        pickle.dump(payload, f)
+
+    metrics_stem = path.stem  # e.g. "model_v9_standard"
+    metrics_file = config.MODELS_DIR / f"metrics_{metrics_stem}.json"
+    metrics_file.write_text(
+        json.dumps({k: v["metrics"] for k, v in results.items()}, indent=2),
+        encoding="utf-8",
+    )
+    log.info(f"Models saved → {path}")
+
+
+def load_models(model_file: Optional[Path] = None) -> dict:
+    path = Path(model_file) if model_file else config.MODEL_FILE
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def chronological_split(df: pd.DataFrame, target: str, train_ratio: float = 0.8):
+    """The exact split `train_model` will use. Exposed so the promotion gate can score the
+    INCUMBENT on the same rows the candidate is scored on."""
+    d = df.dropna(subset=[target]).copy().sort_values("date").reset_index(drop=True)
+    return d.iloc[:int(len(d) * train_ratio)], d.iloc[int(len(d) * train_ratio):]
+
+
+def score_payload(payload: dict, df: pd.DataFrame, target: str) -> float:
+    """Mean per-sub-model log loss of an already-trained payload on `df`.
+
+    WHY THIS EXISTS. The promotion gate used to compare the incumbent's log loss AS RECORDED
+    WHEN IT WAS TRAINED against the candidate's log loss on today's holdout. Those are two
+    different test sets, and on 2026-09-23 the difference stopped being academic: a data fix grew
+    the training frame 33-56% overnight and every model reported a large "improvement"
+    (standard 0.68885 -> 0.64066) that was really a different, larger holdout. A controlled
+    experiment on IDENTICAL test fixtures the same day found no improvement at all from the extra
+    data, so the two cannot both be measuring model quality.
+
+    Scoring the incumbent here, on the candidate's own holdout, makes the comparison mean what it
+    appears to mean. It costs one prediction pass and no retraining.
+
+    Deliberately the MEAN OF SUB-MODEL log losses rather than the ensemble's, because that is
+    what the candidate side reports; comparing a mean against an ensemble would swap one
+    apples-to-oranges problem for another.
+    """
+    import numpy as np
+    from sklearn.metrics import log_loss as _ll
+    X, _ = _prep(df, payload.get("feature_cols"))
+    y = df[target].values
+    out = []
+    for name, m in (payload.get("models") or {}).items():
+        if name == "__meta__":
+            continue
+        try:
+            p = np.clip(m.predict_proba(X)[:, 1], 1e-15, 1 - 1e-15)
+            out.append(_ll(y, p))
+        except Exception:                                            # noqa: BLE001
+            continue
+    return float(np.mean(out)) if out else float("nan")
+
+
+# ── Inference ─────────────────────────────────────────────────────────────────
+
+def predict_proba(df: pd.DataFrame, payload: Optional[dict] = None,
+                  model_file: Optional[Path] = None) -> pd.Series:
+    """
+    Return ensemble P(over 2.5) for each row in df.
+    Uses meta-logistic learned blend if available, otherwise simple mean.
+    """
+    if payload is None:
+        payload = load_models(model_file)
+
+    feat_cols  = payload["feature_cols"]
+    X, _       = _prep(df, feat_cols)
+    base_models = {k: v for k, v in payload["models"].items() if k != "__meta__"}
+    meta_model  = payload["models"].get("__meta__")
+
+    probas = [m.predict_proba(X)[:, 1] for m in base_models.values()]
+
+    if meta_model is not None and len(probas) >= 2:
+        try:
+            meta_X   = np.column_stack(probas)
+            ensemble = meta_model.predict_proba(meta_X)[:, 1]
+        except Exception:
+            ensemble = np.mean(probas, axis=0)
+    else:
+        ensemble = np.mean(probas, axis=0)
+
+    return pd.Series(ensemble, index=df.index, name="p_over25")
+
+
+# ── Feature importances ───────────────────────────────────────────────────────
+
+def get_feature_importances(payload: dict) -> pd.DataFrame:
+    """
+    Extract feature importances from the GradientBoosting model.
+    Returns a sorted DataFrame.
+    """
+    gb_model = payload["models"].get("gradient_boost")
+    feat_cols = payload["feature_cols"]
+
+    if gb_model is None:
+        return pd.DataFrame()
+
+    try:
+        # Our _CalibratedModel stores the pipeline as _pipe
+        pipe = gb_model._pipe
+        gb = pipe.named_steps["clf"]
+        importances = gb.feature_importances_
+        df = pd.DataFrame({
+            "feature":    feat_cols,
+            "importance": importances,
+        }).sort_values("importance", ascending=False).reset_index(drop=True)
+        df["importance_%"] = (df["importance"] * 100).round(2)
+        return df
+    except Exception:
+        return pd.DataFrame()

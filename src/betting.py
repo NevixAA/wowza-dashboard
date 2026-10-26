@@ -1,0 +1,483 @@
+"""
+Value Betting Engine — v9
+==========================
+v8 core + additions from v7:
+
+1. Both-losing guard — REMOVED (2026-06-25)
+   Was: read the both_losing flag from v7's best_params.json and force all of a
+   flagged league's signals to AVOID. Removed because it was a stale v7 artifact
+   that silently muted whole leagues (Championship, Serie B). The both_losing
+   column is still computed for visibility but no longer suppresses any bet.
+
+2. Drift tier adjustment — REMOVED (owner decision 2026-10-26)
+   Was: after the base tier, SNIPER+Conflicted -> MARKSMAN, MARKSMAN+Confirmed -> SNIPER (edge >=
+   DRIFT_UPGRADE_EDGE), VALUABLE+Confirmed -> MARKSMAN. Never validated, and on settled live tips the
+   Confirmed bucket it upgraded lost (-9.1%) while the Neutral bucket it ignored won (+13.6%).
+   Now gated by the constant config.DRIFT_TIER_ADJUSTMENT (False): signal_tier is the base tier only.
+   drift_signal is still computed as information and the old rule's answer is kept as
+   drift_shadow_tier (never served, tiered, staked or sent). See docs/DEPRECATION_REGISTER.md.
+
+Fixed 3-tier labels (league-independent):
+  SNIPER  — edge >= 0.10   → bet full stake
+  VALUE   — edge >= 0.04   → bet half stake / monitor
+  AVOID   — edge <  0.04   → skip
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+from datetime import datetime, timezone
+import sys
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import config
+
+log = logging.getLogger(__name__)
+
+# ── Per-league params (v9 optimizer output + v7 fallback) ────────────────────
+
+_LEAGUE_PARAMS: Optional[dict] = None
+
+
+def _load_league_params() -> dict:
+    global _LEAGUE_PARAMS
+    if _LEAGUE_PARAMS is not None:
+        return _LEAGUE_PARAMS
+
+    params: dict = {}
+
+    # 1. Try v9 optimizer output first
+    pf9 = config.MODELS_DIR / "best_params_v9.json"
+    if pf9.exists():
+        try:
+            params = json.loads(pf9.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    # 2. Merge v7 best_params.json — pull both_losing flags and min-odds if missing
+    v7_file = config.V7_BEST_PARAMS
+    if v7_file.exists():
+        try:
+            v7 = json.loads(v7_file.read_text(encoding="utf-8"))
+            for league, lp in v7.items():
+                if league not in params:
+                    params[league] = {}
+                # Only import the both_losing flag and min-odds from v7
+                if "both_losing" not in params[league]:
+                    params[league]["both_losing"] = lp.get("both_losing", False)
+                if "min_over_odds" not in params[league]:
+                    params[league]["min_over_odds"] = lp.get("min_over_odds", config.MIN_OVER_ODDS)
+                if "min_under_odds" not in params[league]:
+                    params[league]["min_under_odds"] = lp.get("min_under_odds", config.MIN_UNDER_ODDS)
+        except Exception as e:
+            log.debug(f"Could not load v7 best_params: {e}")
+
+    _LEAGUE_PARAMS = params
+    return _LEAGUE_PARAMS
+
+
+def reload_league_params() -> None:
+    global _LEAGUE_PARAMS
+    _LEAGUE_PARAMS = None
+    _load_league_params()
+
+
+def _get_league_cfg(league: str) -> dict:
+    params = _load_league_params()
+    return params.get(str(league)) or params.get("_default") or {}
+
+
+def _is_both_losing(league: str) -> bool:
+    return bool(_get_league_cfg(league).get("both_losing", False))
+
+
+def _get_min_odds(league: str) -> tuple[float, float]:
+    lp = _get_league_cfg(league)
+    mo = float(lp.get("min_over_odds",  config.MIN_OVER_ODDS))
+    mu = float(lp.get("min_under_odds", config.MIN_UNDER_ODDS))
+    return mo, mu
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _kelly(p: float, odds: float) -> float:
+    b = odds - 1.0
+    if b <= 0 or p <= 0:
+        return 0.0
+    return float(np.clip((b * p - (1 - p)) / b, 0.0, 1.0))
+
+
+def _stake(edge: float, p: float, odds: float, threshold: float) -> float:
+    if edge < threshold:
+        return 0.0
+    if config.USE_KELLY:
+        return round(_kelly(p, odds) * config.KELLY_FRACTION * config.FLAT_STAKE, 4)
+    return config.FLAT_STAKE
+
+
+_STANDARD_TH_CACHE = None
+
+
+def _load_standard_thresholds() -> dict:
+    """Auto-optimized per-league standard O/U thresholds (best_params_standard.json),
+    written by optimize_standard_thresholds each backtest. Empty dict when the file is
+    absent → _base_tier falls back to the hand-set config.LEAGUE_SNIPER_THRESHOLDS
+    (i.e. identical to the old behaviour), so this can never regress an env without it."""
+    global _STANDARD_TH_CACHE
+    if _STANDARD_TH_CACHE is None:
+        import json
+        f = config.MODELS_DIR / "best_params_standard.json"
+        try:
+            _STANDARD_TH_CACHE = json.loads(f.read_text()) if f.exists() else {}
+        except Exception:
+            _STANDARD_TH_CACHE = {}
+    return _STANDARD_TH_CACHE
+
+
+def _base_tier(edge: float, side: str = "", league: str = "") -> str:
+    """
+    Three-tier signal system:
+      SNIPER   — meets per-league threshold (highest confidence, full stake)
+      MARKSMAN — edge >= MARKSMAN_THRESHOLD (medium-high, 3/4 stake)
+      VALUABLE — edge >= VALUABLE_THRESHOLD (moderate, half stake / monitor)
+      AVOID    — below threshold
+    """
+    # Prefer the AUTO-OPTIMIZED per-league threshold (best_params_standard.json) when
+    # present, else the hand-set config.LEAGUE_SNIPER_THRESHOLDS, else side-specific global.
+    # Use the auto-optimized threshold ONLY for real-money-APPROVED leagues (OOS-positive).
+    # A not-approved league's "best" threshold is merely least-bad (often very low → signal
+    # spam), so those fall back to the hand-set config value — they still send tips (paper),
+    # just at a sane volume. This is what lets every league notify without flooding the channel.
+    _opt = _load_standard_thresholds().get(str(league)) if league else None
+    if _opt and _opt.get("approved") and _opt.get("sniper_th") is not None:
+        has_per_league = True
+        sniper_thresh  = float(_opt["sniper_th"])
+    elif league and league in config.LEAGUE_SNIPER_THRESHOLDS:
+        has_per_league = True
+        sniper_thresh  = config.LEAGUE_SNIPER_THRESHOLDS[league]
+    elif side == "OVER":
+        has_per_league = False
+        sniper_thresh  = config.SNIPER_THRESHOLD_OVER
+    elif side == "UNDER":
+        has_per_league = False
+        sniper_thresh  = config.SNIPER_THRESHOLD_UNDER
+    else:
+        has_per_league = False
+        sniper_thresh  = config.SNIPER_THRESHOLD
+
+    if edge >= sniper_thresh:
+        return "SNIPER"
+
+    # Ceiling only applies to leagues using the global threshold (no per-league calibration).
+    # Per-league thresholds are backtest-optimised — no ceiling needed there.
+    # Per-league ceilings override global for new-format leagues with thinner data.
+    if not has_per_league:
+        ceiling = config.LEAGUE_EDGE_CEILING.get(league, config.EDGE_CEILING) \
+                  if hasattr(config, "LEAGUE_EDGE_CEILING") else config.EDGE_CEILING
+        if edge > ceiling:
+            return "MARKSMAN"
+
+    # MARKSMAN floor: optimized marksman_th only for APPROVED leagues, else per-league
+    # override, else global (mirrors the SNIPER logic above).
+    if _opt and _opt.get("approved") and _opt.get("marksman_th") is not None:
+        mm_thresh = float(_opt["marksman_th"])
+    else:
+        league_mm_thresh = getattr(config, "LEAGUE_MARKSMAN_THRESHOLDS", {}).get(league)
+        mm_thresh = league_mm_thresh if league_mm_thresh is not None else config.MARKSMAN_THRESHOLD
+
+    if edge >= mm_thresh:
+        return "MARKSMAN"
+    if edge >= config.VALUABLE_THRESHOLD:
+        return "VALUABLE"
+    return "AVOID"
+
+
+def _apply_drift_adjustment(tier: str, drift_signal: str, best_edge: float) -> str:
+    """
+    The REMOVED drift rule (owner decision 2026-10-26), kept only to compute drift_shadow_tier:
+    what the old rule WOULD have produced. It changes signal_tier only while
+    config.DRIFT_TIER_ADJUSTMENT is True, which it is not (and no env var can make it so).
+      SNIPER   + Conflicted  → MARKSMAN  (market disagrees — one step down)
+      MARKSMAN + Confirmed   → SNIPER    (market confirms, edge strong enough)
+      VALUABLE + Confirmed   → MARKSMAN  (market confirms moderate edge)
+    """
+    if tier == "SNIPER" and drift_signal == "Conflicted":
+        log.debug(f"Drift downgrade SNIPER→MARKSMAN (Conflicted, edge={best_edge:.3f})")
+        return "MARKSMAN"
+    if tier == "MARKSMAN" and drift_signal == "Confirmed" and best_edge >= config.DRIFT_UPGRADE_EDGE:
+        log.debug(f"Drift upgrade MARKSMAN→SNIPER (Confirmed, edge={best_edge:.3f})")
+        return "SNIPER"
+    if tier == "VALUABLE" and drift_signal == "Confirmed":
+        log.debug(f"Drift upgrade VALUABLE→MARKSMAN (Confirmed, edge={best_edge:.3f})")
+        return "MARKSMAN"
+    return tier
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def evaluate_value(df: pd.DataFrame, p_col: str = "p_over25") -> pd.DataFrame:
+    """
+    Add value betting columns to df.
+
+    Required input columns : p_over25, odds_over25, odds_under25, league
+    Optional (drift)       : drift_signal
+
+    Added columns:
+        impl_prob_over, impl_prob_under
+        edge_over, edge_under
+        kelly_over, kelly_under
+        ev_over, ev_under
+        stake_over, stake_under
+        tier_over, tier_under
+        min_odds_blocked
+        bet                 OVER | UNDER | AVOID
+        bet_stake
+        signal_tier         SNIPER | MARKSMAN | VALUABLE | AVOID  (NOT drift-adjusted)
+        drift_shadow_tier   what the removed drift rule would have produced (info only)
+        both_losing         True/False — league flagged by v7 optimizer
+    """
+    df = df.copy()
+
+    p_over  = pd.to_numeric(df[p_col], errors="coerce").clip(0.001, 0.999)
+    p_under = 1.0 - p_over
+    ov_odds = pd.to_numeric(df["odds_over25"],  errors="coerce").replace(0, np.nan)
+    un_odds = pd.to_numeric(df["odds_under25"], errors="coerce").replace(0, np.nan)
+
+    df["impl_prob_over"]  = 1.0 / ov_odds
+    df["impl_prob_under"] = 1.0 / un_odds
+    df["edge_over"]  = p_over  - df["impl_prob_over"]
+    df["edge_under"] = p_under - df["impl_prob_under"]
+
+    df["kelly_over"]  = [_kelly(p, o) for p, o in zip(p_over,  ov_odds.fillna(0))]
+    df["kelly_under"] = [_kelly(p, o) for p, o in zip(p_under, un_odds.fillna(0))]
+
+    df["ev_over"]  = df["edge_over"]  * ov_odds
+    df["ev_under"] = df["edge_under"] * un_odds
+
+    # Per-league min-odds
+    n = len(df)
+    mo_arr = np.full(n, config.MIN_OVER_ODDS)
+    mu_arr = np.full(n, config.MIN_UNDER_ODDS)
+    if "league" in df.columns:
+        for lg in df["league"].unique():
+            mask = (df["league"] == lg).values
+            mo, mu = _get_min_odds(str(lg))
+            mo_arr[mask] = mo
+            mu_arr[mask] = mu
+
+    mo_s = pd.Series(mo_arr, index=df.index)
+    mu_s = pd.Series(mu_arr, index=df.index)
+
+    # Both-losing guard (from v7 optimizer)
+    if "league" in df.columns:
+        df["both_losing"] = df["league"].map(lambda lg: _is_both_losing(str(lg)))
+    else:
+        df["both_losing"] = False
+
+    # Stake (uses VALUE_THRESHOLD as minimum to award stake)
+    df["stake_over"]  = [_stake(e, p, o, config.VALUE_THRESHOLD) for e, p, o in
+                         zip(df["edge_over"],  p_over,  ov_odds.fillna(0))]
+    df["stake_under"] = [_stake(e, p, o, config.VALUE_THRESHOLD) for e, p, o in
+                         zip(df["edge_under"], p_under, un_odds.fillna(0))]
+
+    # Base tier — per-league threshold if available, else side-specific global
+    leagues = df.get("league", pd.Series([""] * len(df), index=df.index))
+    df["tier_over"]  = [_base_tier(e, "OVER",  lg) for e, lg in zip(df["edge_over"],  leagues)]
+    df["tier_under"] = [_base_tier(e, "UNDER", lg) for e, lg in zip(df["edge_under"], leagues)]
+
+    # Min-odds filter
+    over_odds_ok  = ov_odds >= mo_s
+    under_odds_ok = un_odds >= mu_s
+
+    # New-format price cap (config.NF_MAX_OU_ODDS, owner 2026-10-22): a new-format side priced above
+    # the cap is not bettable. Still scored and logged - only the tip is withheld.
+    cap = float(getattr(config, "NF_MAX_OU_ODDS", 0) or 0)
+    if cap > 0 and "league" in df.columns:
+        nf = df["league"].map(lambda lg: config.model_type_for_league(str(lg)) == "new_format").astype(bool)
+        over_cap, under_cap = nf & (ov_odds > cap), nf & (un_odds > cap)
+        df["max_odds_blocked"] = (((df["edge_over"] >= config.VALUE_THRESHOLD) & over_cap) |
+                                  ((df["edge_under"] >= config.VALUE_THRESHOLD) & under_cap))
+        over_odds_ok = over_odds_ok & ~over_cap
+        under_odds_ok = under_odds_ok & ~under_cap
+    else:
+        df["max_odds_blocked"] = False
+
+    df["min_odds_blocked"] = (
+        ((df["edge_over"]  >= config.VALUE_THRESHOLD) & ~over_odds_ok.fillna(False)) |
+        ((df["edge_under"] >= config.VALUE_THRESHOLD) & ~under_odds_ok.fillna(False))
+    )
+
+    # Bet direction (requires edge >= VALUE_THRESHOLD + min-odds)
+    # NOTE: both_losing guard removed — it was a stale v7 artifact that hard-muted
+    # whole leagues (e.g. Championship, Serie B). The flag is still computed below
+    # for visibility but no longer suppresses any bet.
+    over_q  = (df["edge_over"]  >= config.VALUE_THRESHOLD) & over_odds_ok.fillna(False)
+    under_q = (df["edge_under"] >= config.VALUE_THRESHOLD) & under_odds_ok.fillna(False)
+
+    df["bet"] = "AVOID"
+    df.loc[over_q,  "bet"] = "OVER"
+    df.loc[under_q, "bet"] = "UNDER"
+    both = over_q & under_q
+    df.loc[both, "bet"] = np.where(
+        df.loc[both, "edge_over"] >= df.loc[both, "edge_under"], "OVER", "UNDER"
+    )
+
+    df["bet_stake"] = np.where(
+        df["bet"] == "OVER",  df["stake_over"],
+        np.where(df["bet"] == "UNDER", df["stake_under"], 0.0)
+    )
+
+    # Best edge / side
+    best_is_over = df["edge_over"] >= df["edge_under"]
+    df["best_edge"] = np.where(best_is_over, df["edge_over"], df["edge_under"])
+    df["best_side"] = np.where(best_is_over, "OVER", "UNDER")
+
+    # signal_tier: base tier on best edge side
+    raw_tier = np.where(best_is_over, df["tier_over"], df["tier_under"])
+    df["signal_tier"] = raw_tier
+
+    # Force AVOID when below VALUE_THRESHOLD
+    df.loc[df["best_edge"] < config.VALUE_THRESHOLD, "signal_tier"] = "AVOID"
+
+    # A tier with no bettable side is a contradiction — force AVOID (fixed 2026-08-16).
+    # `bet` additionally requires the side to clear MIN_OVER_ODDS / MIN_UNDER_ODDS, whereas
+    # signal_tier is derived from best_edge alone. A fixture priced below the minimum
+    # therefore kept a live tier while `bet` stayed at its "AVOID" default, and
+    # generate_bets — which filters on signal_tier only — published it as a tip.
+    #
+    # The result was 122 ledger rows with side="AVOID", going back to 2026-04-28: 90
+    # VALUABLE, 30 SNIPER, 2 MARKSMAN. EVERY ONE is still pending and always will be,
+    # because _find_result can only grade OVER or UNDER. They inflate tip counts, never
+    # settle, and quietly distort win-rate denominators.
+    # Example: Molde v Tromso @1.71 with MIN_OVER_ODDS=1.75 — tagged MARKSMAN, unbettable.
+    df.loc[~df["bet"].isin(["OVER", "UNDER"]), "signal_tier"] = "AVOID"
+
+    # ── Blind-fixture guard ───────────────────────────────────────────────────
+    # A fixture with no rolling-form history does NOT produce a cautious prediction — it
+    # produces a confident-looking wrong one. _prep() median-imputes the missing features,
+    # the model scores the league average, and the edge calculation cannot tell that apart
+    # from a real disagreement with the book. Live example 2026-08-15: York City (promoted
+    # from the National League, zero history in the 4-season window) v Bristol Rovers showed
+    # the second-strongest EFL edge on the board at 4.4% — built entirely on imputed values.
+    #
+    # These are mostly cup ties, where OddsAPI tags the fixture with the home club's domestic
+    # league so the opponent has no history in that competition, plus newly promoted clubs.
+    # Refusing to bet them is the correct answer; guessing is not.
+    _CORE_FORM = ["home_scored_last5", "away_scored_last5",
+                  "home_conceded_last5", "away_conceded_last5"]
+    _present = [c for c in _CORE_FORM if c in df.columns]
+    if _present:
+        _blind = df[_present].isna().any(axis=1)
+        df["no_form_data"] = _blind
+        # REQUIRE_FORM_DATA (env, default "1") is the blind-fixture guard of invariant 8.
+        #
+        # It exists because missing features are MEDIAN-IMPUTED, so a fixture with no history
+        # produces a confident-looking WRONG edge rather than a cautious one: York City, with no
+        # rolling form at all, once showed the second-strongest EFL edge on the board at 4.4%,
+        # built on nothing. The imputed median is by construction an average team, so any fixture
+        # whose real teams differ from average gets a spurious edge in whichever direction the
+        # opponent's real features point.
+        #
+        # Disabled for the 2026/27 test season by owner decision (2026-08-21): the season is
+        # explicitly a data-gathering exercise, stakes are nominal or zero, and Pro records every
+        # signal regardless of tier, so these fixtures become training observations instead of
+        # being discarded. On the board at the time this unblocked 10 fixtures carrying a real
+        # edge, including Sturm Graz v Austria Lustenau UNDER at 15.6% — a SNIPER-sized number
+        # standing on imputed features.
+        #
+        # The FLAG IS STILL RECORDED either way. That is the part that must not be lost: without
+        # `no_form_data` in the output there is no way to separate a tip backed by history from one
+        # backed by a median, and any later ROI or CLV comparison would silently pool the two.
+        # SELF-EXPIRING OVERRIDE. The disable is only defensible while the season is too young
+        # for 5-game rolling form to exist at all. From roughly GW5 every club has five matches in
+        # its own division, `_blind` empties by itself, and the guard costs nothing — while a
+        # STILL-blind fixture after that point is a genuine data problem (a mid-season promotion, a
+        # name-resolution miss, a collection gap) and is exactly what the guard should catch.
+        #
+        # So the override carries a hard expiry rather than trusting anyone to remember. After
+        # REQUIRE_FORM_DATA_UNTIL the guard is active again regardless of the env flag. 2026-09-15
+        # is ~GW5 across the standard divisions (they started mid-August) with margin for the
+        # staggered starts in La Liga 2 and Serie B.
+        _guard_off_until = os.getenv("REQUIRE_FORM_DATA_UNTIL", "2026-09-15")
+        _today = datetime.now(timezone.utc).date().isoformat()
+        _expired = _today >= _guard_off_until
+        _require_form = (
+            os.getenv("REQUIRE_FORM_DATA", "1").strip().lower() not in ("0", "false", "no")
+            or _expired
+        )
+        if _expired and os.getenv("REQUIRE_FORM_DATA", "1").strip().lower() in ("0", "false", "no"):
+            log.info(f"Blind-fixture guard RE-ENABLED automatically: {_today} >= "
+                     f"{_guard_off_until} (REQUIRE_FORM_DATA=0 has expired)")
+        if _blind.any() and _require_form:
+            df.loc[_blind, "signal_tier"] = "AVOID"
+            df.loc[_blind, "bet"]         = "AVOID"
+            df.loc[_blind, "bet_stake"]   = 0.0
+            log.info(f"Blind-fixture guard: {int(_blind.sum())} fixture(s) forced to AVOID "
+                     f"(no rolling-form history)")
+        elif _blind.any():
+            log.warning(f"Blind-fixture guard DISABLED (REQUIRE_FORM_DATA=0): "
+                        f"{int(_blind.sum())} fixture(s) with NO rolling-form history are being "
+                        f"tiered on MEDIAN-IMPUTED features. Their edges are not backed by "
+                        f"history — see no_form_data in the output.")
+    else:
+        df["no_form_data"] = False
+
+    # Drift: INFORMATION ONLY since 2026-10-26 (owner decision). The removed rule's answer is kept as
+    # drift_shadow_tier so a future frozen forward test can measure it; signal_tier is untouched
+    # unless config.DRIFT_TIER_ADJUSTMENT is True (a code constant - see drift_tier_adjustment_enabled).
+    if "drift_signal" in df.columns:
+        df["drift_shadow_tier"] = drift_shadow_tiers(df)
+        if drift_tier_adjustment_enabled():
+            df["signal_tier"] = df["drift_shadow_tier"]
+
+    return df
+
+
+def drift_tier_adjustment_enabled() -> bool:
+    """config.DRIFT_TIER_ADJUSTMENT, and ONLY that. The rule was removed by owner decision 2026-10-26;
+    an environment variable of the same name is IGNORED (with a warning) so a workflow cannot switch
+    an unvalidated rule back on without a reviewed code change."""
+    env = os.getenv("DRIFT_TIER_ADJUSTMENT")
+    if env is not None:
+        log.warning(f"DRIFT_TIER_ADJUSTMENT={env!r} in the environment is IGNORED: the drift tier "
+                    f"adjustment was removed by owner decision 2026-10-26 and is controlled only by "
+                    f"the config.py constant (currently {bool(config.DRIFT_TIER_ADJUSTMENT)}).")
+    return bool(getattr(config, "DRIFT_TIER_ADJUSTMENT", False))
+
+
+def drift_shadow_tiers(df: pd.DataFrame) -> list:
+    """The tier the REMOVED drift rule would have produced for each row (AVOID stays AVOID)."""
+    out = []
+    for tier, drift, edge in zip(df["signal_tier"].astype(str),
+                                 df["drift_signal"].astype(str),
+                                 pd.to_numeric(df["best_edge"], errors="coerce").fillna(0.0)):
+        out.append("AVOID" if tier == "AVOID" else _apply_drift_adjustment(tier, drift, float(edge)))
+    return out
+
+
+def generate_bets(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return SNIPER + VALUE rows sorted by best_edge descending.
+    Both confirmed bets (bet=OVER/UNDER) and VALUE-tier fixtures below per-league
+    threshold are included — giving full visibility into all 3 tiers.
+    """
+    df = df.copy()
+    visible = df[df["signal_tier"].isin(["SNIPER", "MARKSMAN", "VALUABLE"])].copy()
+    visible = visible.sort_values("best_edge", ascending=False)
+
+    output_cols = [
+        "date", "kickoff_utc", "league", "home_team", "away_team",
+        "best_side", "odds_over25", "odds_under25",
+        "edge_over", "edge_under", "best_edge",
+        "bet", "bet_stake", "signal_tier",
+        "drift_signal", "over_drift", "under_drift", "odds_snapshots",
+        "both_losing", "min_odds_blocked", "model_type",
+    ]
+    output_cols = [c for c in output_cols if c in visible.columns]
+    return visible[output_cols].reset_index(drop=True)

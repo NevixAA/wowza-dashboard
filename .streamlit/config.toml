@@ -1,0 +1,27 @@
+# Wowza dashboard theme (visual redesign 2026-10-25).
+# Mirrors dashboard_ui.DARK / dashboard_ui.LIGHT - tests/test_design_system.py fails if they drift.
+# DARK ONLY (owner brief 2026-10-25: 'consistent dark theme'): no light block, so the app does not
+# follow a viewer's light system setting.
+# The named colours (green/red/orange/violet/blue/gray) are what st.badge and :colour[text] use, so
+# setting them here is how the semantic tokens reach Streamlit's native elements.
+
+[theme]
+base = "dark"
+font = "sans-serif"
+baseRadius = "medium"
+showWidgetBorder = true
+chartCategoricalColors = ["#4C8DF6", "#E2A93B", "#A47EF2", "#2BB59B", "#E86A3F", "#7C8A9A"]
+
+[theme.dark]
+primaryColor = "#4C8DF6"
+backgroundColor = "#0B1016"
+secondaryBackgroundColor = "#131A23"
+textColor = "#E7EDF4"
+borderColor = "#243040"
+dataframeBorderColor = "#243040"
+greenColor = "#2BB59B"
+redColor = "#E86A3F"
+orangeColor = "#E2A93B"
+violetColor = "#A47EF2"
+blueColor = "#4C8DF6"
+grayColor = "#7C8A9A"

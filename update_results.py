@@ -1,0 +1,1764 @@
+"""
+Update bets_ledger.csv with actual match results.
+
+Fetches completed match scores from OddsAPI and fills in `result` (WIN/LOSS/VOID)
+and `pnl` for any tips where the match has been played but the result is missing.
+
+PnL is calculated on a flat 1-unit stake:
+    WIN  → +(odds - 1)
+    LOSS → -1.0
+    VOID → 0.0
+
+Usage
+-----
+    python update_results.py           # fetch last 3 days of completed matches
+    python update_results.py --days 7  # look back further
+    python update_results.py --dry-run # show what would change, no writes
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import sys
+import unicodedata
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import requests
+
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import config
+
+LEDGER_FILE        = config.OUTPUT_DIR / "bets_ledger.csv"
+PLAYER_LEDGER_FILE = config.OUTPUT_DIR / "player_ledger.csv"
+SHARP_LEDGER_FILE  = config.OUTPUT_DIR / "sharp_ledger.csv"
+SIDE_LEDGER_FILE   = config.OUTPUT_DIR / "side_bets_ledger.csv"
+
+
+# ── Team name normalisation ───────────────────────────────────────────────────
+
+def _norm(name: str) -> str:
+    """Lowercase + strip accents for fuzzy matching."""
+    nfkd = unicodedata.normalize("NFKD", str(name))
+    ascii_str = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return ascii_str.lower().strip()
+
+
+def _names_match(a: str, b: str) -> bool:
+    """True if two team names refer to the same club (normalised exact or substring)."""
+    na, nb = _norm(a), _norm(b)
+    if na == nb:
+        return True
+    # substring both ways (handles "Man City" vs "Manchester City" style)
+    if na in nb or nb in na:
+        return True
+    # first-word match for short names
+    if na.split()[0] == nb.split()[0] and len(na.split()[0]) >= 4:
+        return True
+    return False
+
+
+# ── football-data.co.uk scores fetch ─────────────────────────────────────────
+# "new" format: football-data.co.uk/new/{code}.csv  (cols: Home/Away/HG/AG/Date, no HT)
+# "std" format: football-data.co.uk/mmz4281/2526/{code}.csv (cols: HomeTeam/AwayTeam/FTHG/FTAG/HTHG/HTAG/Date)
+# Tuple: (fmt, code, home_col, away_col, ft_hg, ft_ag, date_col, ht_hg, ht_ag)
+
+_FD_SOURCES = {
+    # new format — no HT columns available
+    "Austrian Bundesliga":      ("new", "AUT", "Home", "Away", "HG",   "AG",   "Date", None,   None),
+    "Sweden Allsvenskan":       ("new", "SWE", "Home", "Away", "HG",   "AG",   "Date", None,   None),
+    "Denmark Superliga":        ("new", "DNK", "Home", "Away", "HG",   "AG",   "Date", None,   None),
+    "Japan J-League":           ("new", "JPN", "Home", "Away", "HG",   "AG",   "Date", None,   None),
+    "USA MLS":                  ("new", "USA", "Home", "Away", "HG",   "AG",   "Date", None,   None),
+    "China Super League":       ("new", "CHN", "Home", "Away", "HG",   "AG",   "Date", None,   None),
+    "Ireland Premier Division": ("new", "IRL", "Home", "Away", "HG",   "AG",   "Date", None,   None),
+    # standard format — includes HTHG/HTAG (half-time scores)
+    "Bundesliga 2":             ("std", "D2",  "HomeTeam", "AwayTeam", "FTHG", "FTAG", "Date", "HTHG", "HTAG"),
+    "La Liga 2":                ("std", "SP2", "HomeTeam", "AwayTeam", "FTHG", "FTAG", "Date", "HTHG", "HTAG"),
+    "Ligue 2":                  ("std", "F2",  "HomeTeam", "AwayTeam", "FTHG", "FTAG", "Date", "HTHG", "HTAG"),
+    "League One":               ("std", "E2",  "HomeTeam", "AwayTeam", "FTHG", "FTAG", "Date", "HTHG", "HTAG"),
+    "League Two":               ("std", "E3",  "HomeTeam", "AwayTeam", "FTHG", "FTAG", "Date", "HTHG", "HTAG"),
+    "Greek Super League":       ("std", "G1",  "HomeTeam", "AwayTeam", "FTHG", "FTAG", "Date", "HTHG", "HTAG"),
+    "Belgian First Division A": ("std", "B1",  "HomeTeam", "AwayTeam", "FTHG", "FTAG", "Date", "HTHG", "HTAG"),
+}
+
+_FD_NEW_URL = "https://www.football-data.co.uk/new/{code}.csv"
+_FD_STD_URL = "https://www.football-data.co.uk/mmz4281/2526/{code}.csv"
+
+def fetch_scores_fd(league: str) -> list[dict]:
+    """Fetch completed results from football-data.co.uk (free, no quota). Includes HT scores where available."""
+    if league not in _FD_SOURCES:
+        return []
+
+    fmt, code, home_col, away_col, hg_col, ag_col, date_col, ht_hg_col, ht_ag_col = _FD_SOURCES[league]
+
+    try:
+        from io import StringIO
+
+        url = _FD_NEW_URL.format(code=code) if fmt == "new" else _FD_STD_URL.format(code=code)
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200:
+            log.debug(f"  FD {league}: HTTP {r.status_code}")
+            return []
+
+        raw = pd.read_csv(StringIO(r.text), encoding="utf-8-sig",
+                          on_bad_lines="skip", low_memory=False)
+
+        if fmt == "new" and "Season" in raw.columns:
+            raw = raw[raw["Season"].astype(str).str.contains("2025|2026")].copy()
+
+        results = []
+        for _, row in raw.iterrows():
+            try:
+                hg = int(float(row[hg_col]))
+                ag = int(float(row[ag_col]))
+                dt = pd.to_datetime(row[date_col], dayfirst=True, errors="coerce")
+                if pd.isna(dt):
+                    continue
+
+                entry = {
+                    "home_team":  str(row[home_col]).strip(),
+                    "away_team":  str(row[away_col]).strip(),
+                    "home_score": hg,
+                    "away_score": ag,
+                    "date_str":   str(dt.date()),
+                }
+
+                # HT scores (standard format only)
+                if ht_hg_col and ht_ag_col:
+                    try:
+                        entry["ht_home"] = int(float(row[ht_hg_col]))
+                        entry["ht_away"] = int(float(row[ht_ag_col]))
+                    except (ValueError, KeyError):
+                        pass
+
+                results.append(entry)
+            except (ValueError, KeyError):
+                continue
+
+        log.info(f"  FD {league}: {len(results)} completed matches loaded")
+        return results
+
+    except Exception as e:
+        log.warning(f"  FD {league} exception: {e}")
+        return []
+
+
+# ── OddsAPI scores fetch ──────────────────────────────────────────────────────
+
+def fetch_scores(sport_key: str, days_from: int) -> list[dict]:
+    """
+    Fetch completed events from OddsAPI scores endpoint.
+    Returns list of dicts: {home_team, away_team, home_score, away_score, date_str}.
+    """
+    url = f"https://api.the-odds-api.com/v4/sports/{sport_key}/scores"
+    try:
+        r = requests.get(
+            url,
+            params={
+                "apiKey":    config.ODDS_API_KEY,
+                "daysFrom":  min(days_from, 3),  # OddsAPI max is 3
+            },
+            timeout=15,
+        )
+        if r.status_code != 200:
+            log.debug(f"  OddsAPI scores {sport_key}: HTTP {r.status_code} — {r.text[:200]}")
+            return []
+
+        results = []
+        for event in r.json():
+            if not event.get("completed"):
+                continue
+            scores = event.get("scores") or []
+            if len(scores) < 2:
+                continue
+
+            score_map: dict[str, int] = {}
+            for s in scores:
+                try:
+                    score_map[s["name"]] = int(s["score"])
+                except (KeyError, ValueError):
+                    pass
+
+            home = event.get("home_team", "")
+            away = event.get("away_team", "")
+            if home not in score_map or away not in score_map:
+                continue
+
+            dt_raw = event.get("commence_time", "")
+            try:
+                dt = pd.to_datetime(dt_raw, utc=True).tz_localize(None)
+            except Exception:
+                continue
+
+            results.append({
+                "home_team":   home,
+                "away_team":   away,
+                "home_score":  score_map[home],
+                "away_score":  score_map[away],
+                "date_str":    str(dt.date()),
+                # OddsAPI event id == the shadow log's fixture_id. Additive: no ledger reads it.
+                "event_id":    event.get("id", ""),
+            })
+        return results
+
+    except Exception as e:
+        log.debug(f"  OddsAPI scores {sport_key} exception: {e}")
+        return []
+
+
+# ── CLV lookup ───────────────────────────────────────────────────────────────
+
+_CSV_ARCHIVES = None
+
+
+# Every persistent odds archive we can pull a closing price out of. All share the schema
+# snapshot_date,snapshot_ts,match_date,league,match,market,odds.
+_ARCHIVE_FILES = (
+    "newformat_odds_dense.csv",               # new-format O/U, EVERY predict run (densest NF)
+    "newformat_odds_history.csv",             # new-format: O/U 2.5 + BTTS + O/U 1.5/3.5, 3x/day
+    "standard_odds_history.csv",              # standard O/U 2.5/1.5/3.5, every predict run
+    "standard_sidemarket_odds_history.csv",   # standard BTTS + O/U 1.5/3.5 (std_odds_capture)
+)
+# Order matters: the dense archives come first so a fixture present in both resolves against
+# the finer-grained curve, whose last snapshot is much closer to the true closing line.
+
+
+def _load_archives() -> list:
+    """Load + key the odds archives once per process."""
+    global _CSV_ARCHIVES
+    if _CSV_ARCHIVES is None:
+        _CSV_ARCHIVES = []
+        for name in _ARCHIVE_FILES:
+            p = config.OUTPUT_DIR / name
+            if not p.exists():
+                continue
+            try:
+                d = pd.read_csv(p)
+                mm = d["match"].astype(str)
+                d["_hk"] = mm.apply(lambda m: _norm(m.split(" vs ")[0]) if " vs " in m else "")
+                d["_ak"] = mm.apply(lambda m: _norm(m.split(" vs ")[1]) if " vs " in m else "")
+                d["_dk"] = d["match_date"].astype(str).str[:10]
+                _CSV_ARCHIVES.append(d)
+            except Exception:
+                pass
+    return _CSV_ARCHIVES
+
+
+def _closing_for_market(home: str, away: str, match_date: str, mkt: str) -> float:
+    """Last archived price for an explicit archive market key
+    (over25 / under25 / btts_yes / over15 / over35 / ...). np.nan when not found."""
+    hk, ak, dk = _norm(home), _norm(away), str(match_date)[:10]
+    for arch in _load_archives():
+        same = arch[(arch["_dk"] == dk) & (arch["market"].astype(str) == mkt)]
+        if same.empty:
+            continue
+        m = same[(same["_hk"] == hk) & (same["_ak"] == ak)]
+        if m.empty:
+            # The ledger carries ODDSAPI team names; these archives carry API-FOOTBALL ones,
+            # and the two spell clubs differently ("Viborg FF"/"Viborg", "OB Odense BK"/
+            # "Odense", "Tijuana"/"Club Tijuana", "Galway United"/"Galway"). Exact equality
+            # therefore silently dropped 126 of 283 recoverable closing prices (CLV coverage
+            # stuck at 23.5%). Fall back to the same identity matcher _find_result already
+            # uses — it is substring/first-word based, so the suffix differences resolve.
+            # _names_match re-normalises internally and _norm is idempotent, so passing the
+            # already-normalised keys is safe.
+            m = same[[_names_match(hk, h) and _names_match(ak, a)
+                      for h, a in zip(same["_hk"], same["_ak"])]]
+        if not m.empty:
+            try:
+                return float(m.sort_values("snapshot_ts").iloc[-1]["odds"])
+            except Exception:
+                pass
+    return np.nan
+
+
+def _closing_from_csv(home: str, away: str, match_date: str, side: str) -> float:
+    """O/U 2.5 closing price from the archives. Used when odds_history_v9.json has already
+    rolled the fixture out (10-day purge) — the cause of new-format's 9% closing coverage."""
+    return _closing_for_market(home, away, match_date,
+                               "under25" if side == "UNDER" else "over25")
+
+
+# side_bets_ledger market key -> the market key used inside the odds archives.
+# The ledger stores the BTTS *Yes* price, which the archives call btts_yes.
+_SIDE_ARCHIVE_MARKET = {"btts": "btts_yes", "over15": "over15", "over35": "over35"}
+
+
+def _closing_odds(home: str, away: str, match_date: str, side: str) -> float:
+    """Closing (last pre-KO) odds: try the ephemeral JSON first, then fall back to the
+    persistent CSV archives so a fixture purged from the JSON still gets a closing price."""
+    val = _closing_odds_json(home, away, match_date, side)
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        val = _closing_from_csv(home, away, match_date, side)
+    return val
+
+
+def _closing_odds_json(home: str, away: str, match_date: str, side: str) -> float:
+    """
+    Return the LAST recorded odds snapshot before kick-off from odds_history_v9.json.
+    This approximates the closing line.
+    """
+    if not config.ODDS_HISTORY_JSON.exists():
+        return np.nan
+    try:
+        history = json.loads(config.ODDS_HISTORY_JSON.read_text(encoding="utf-8"))
+        key = f"{home} vs {away} | {match_date}"
+        snapshots = history.get(key, [])
+        if not snapshots:
+            # Try normalised team names
+            norm_key = next(
+                (k for k in history
+                 if _norm(k.split(" vs ")[0]) == _norm(home)
+                 and len(k.split(" vs ")) > 1
+                 and _norm(k.split(" vs ")[1].split(" | ")[0]) == _norm(away)),
+                None,
+            )
+            snapshots = history.get(norm_key, []) if norm_key else []
+        if not snapshots:
+            return np.nan
+        last = snapshots[-1]
+        field = "under" if side == "UNDER" else "over"
+        val = last.get(field)
+        return float(val) if val is not None else np.nan
+    except Exception:
+        return np.nan
+
+
+# ── API-Football results (last-resort settlement source) ─────────────────────
+
+_AF_RESULTS_CACHE: dict = {}
+
+
+def fetch_scores_apifootball(league: str) -> list[dict]:
+    """Completed fixtures for a league from API-Football, in fetch_scores() shape.
+
+    WHY THIS EXISTS: leagues without a football-data source (Argentina, Brazil, Finland,
+    Norway, Mexico) fall back to the OddsAPI scores endpoint, whose lookback is capped at
+    THREE DAYS (`min(days_from, 3)` — an OddsAPI limit, not ours). A tip in one of those
+    leagues that is not settled within 3 days can therefore NEVER be settled, and 89 such
+    rows had been stranded since May 2026 with no result and no P/L. Another 60 sat in
+    football-data leagues where the fixture or the team names did not reconcile.
+
+    API-Football has all of them and `fetch_league_fixture_results` is cached for a YEAR
+    (completed results never change), so this is one call per league per season.
+
+    Called LAZILY — only for a row the primary source could not resolve — so a healthy run
+    where everything settles normally makes no extra API calls at all. That matters: this
+    job runs every 2 hours and has no actions/cache step.
+    """
+    if league in _AF_RESULTS_CACHE:
+        return _AF_RESULTS_CACHE[league]
+
+    out: list[dict] = []
+    lid = config.API_FOOTBALL_IDS.get(league)
+    if lid:
+        season = config.API_FOOTBALL_SEASONS.get(league, config.API_SEASON)
+        try:
+            from src.api_football_ou import fetch_league_fixture_results
+            df = fetch_league_fixture_results(lid, season, league)
+            for _, r in df.iterrows():
+                try:
+                    hg, ag = int(r["home_goals"]), int(r["away_goals"])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                ev = {
+                    "home_team":  str(r.get("home_team", "")),
+                    "away_team":  str(r.get("away_team", "")),
+                    "home_score": hg,
+                    "away_score": ag,
+                    "date_str":   str(r.get("date", ""))[:10],
+                }
+                hh, ha = r.get("ht_home_goals"), r.get("ht_away_goals")
+                if pd.notna(hh) and pd.notna(ha):
+                    ev["ht_home"], ev["ht_away"] = int(hh), int(ha)
+                out.append(ev)
+            log.info(f"  [api-football] {league}: {len(out)} completed fixtures "
+                     f"(season {season}) for fallback settlement")
+        except Exception as e:
+            log.warning(f"  [api-football] {league}: results fetch failed ({e})")
+    else:
+        log.debug(f"  [api-football] {league}: no API_FOOTBALL_IDS entry")
+
+    _AF_RESULTS_CACHE[league] = out
+    return out
+
+
+# ── Result lookup ─────────────────────────────────────────────────────────────
+
+def _find_result(
+    home: str, away: str, date_str: str, side: str,
+    completed: list[dict],
+) -> tuple[str, float, dict] | None:
+    """
+    Search `completed` for this fixture.
+    Returns (result_str, total_goals, extras) or None if not found.
+    extras contains ht_total if HT scores are available.
+    """
+    for ev in completed:
+        if ev["date_str"] != date_str:
+            continue
+        if not (_names_match(home, ev["home_team"]) and _names_match(away, ev["away_team"])):
+            continue
+
+        total = ev["home_score"] + ev["away_score"]
+        ht_total = ev.get("ht_home", -1) + ev.get("ht_away", -1) if "ht_home" in ev else None
+
+        if side == "OVER":
+            won = total > 2.5
+        elif side == "UNDER":
+            won = total <= 2.5
+        elif side == "HT_OVER_0.5":
+            won = ht_total is not None and ht_total >= 1
+        elif side == "HT_UNDER_0.5":
+            won = ht_total is not None and ht_total < 1
+        elif side == "HT_OVER_1.5":
+            won = ht_total is not None and ht_total >= 2
+        elif side == "HT_UNDER_1.5":
+            won = ht_total is not None and ht_total <= 1
+        else:
+            return None
+
+        if side.startswith("HT_") and ht_total is None:
+            return None  # no HT data available, can't grade
+
+        result = "WIN" if won else "LOSS"
+        extras = {}
+        if ht_total is not None:
+            extras["ht_score"] = f"{ev.get('ht_home',0)}-{ev.get('ht_away',0)}"
+            extras["ht_total"] = ht_total
+        return result, total, extras
+
+    return None
+
+
+# ── Player prop result resolver ───────────────────────────────────────────────
+
+def _resolve_player_market(market: str, stats: dict) -> str:
+    """Determine WIN/LOSS for a player prop market given their fixture stats."""
+    if market == "goals":
+        return "WIN" if int(stats.get("goals", 0)) >= 1 else "LOSS"
+    if market == "sot":
+        return "WIN" if int(stats.get("shots_on_target", 0)) >= 1 else "LOSS"
+    if market == "cards":
+        return "WIN" if int(stats.get("yellow_card", 0)) >= 1 else "LOSS"
+    if market == "assists":
+        return "WIN" if int(stats.get("assists", 0)) >= 1 else "LOSS"
+    return ""
+
+
+def _fetch_fixture_player_stats(league_id: int, season: str, date_str: str, home: str, away: str) -> dict[str, dict]:
+    """
+    Returns {norm(player_name): {goals, shots_on_target, yellow_card, assists}}
+    for one match. Uses API-Football (APIFOOTBALL_KEY env var required).
+    """
+    import os
+    api_key = os.getenv("APIFOOTBALL_KEY", "")
+    if not api_key:
+        return {}
+
+    try:
+        from player_model.api_football import find_fixture_id, get_fixture_player_stats
+    except ImportError:
+        log.debug("player_model not importable — cannot resolve player results")
+        return {}
+
+    fixture_id = find_fixture_id(league_id, season, date_str, home, away)
+    if not fixture_id:
+        log.debug(f"  fixture not found: {home} vs {away} {date_str}")
+        return {}
+
+    raw = get_fixture_player_stats(fixture_id)
+    return {_norm(p["player_name"]): p for p in raw if p.get("player_name")}
+
+
+def update_player_results(days: int = 3, dry_run: bool = False) -> None:
+    """Resolve player prop outcomes in player_ledger.csv using API-Football."""
+    if not PLAYER_LEDGER_FILE.exists():
+        log.info("player_ledger.csv not found — skipping player prop resolution")
+        return
+
+    ledger = pd.read_csv(PLAYER_LEDGER_FILE, dtype=str)
+
+    # Add new columns if missing (backward compat with ledgers written before this version)
+    for col in ("is_played", "notes"):
+        if col not in ledger.columns:
+            ledger[col] = ""
+
+    today_str = str(datetime.utcnow().date())
+    pending_mask = (
+        ledger["result"].isna() | (ledger["result"].str.strip() == "")
+    ) & (ledger["match_date"] < today_str)
+    pending = ledger[pending_mask].copy()
+
+    if pending.empty:
+        log.info("player_ledger: no pending player prop results")
+        return
+
+    log.info(f"player_ledger: {len(pending)} pending tip(s) to resolve")
+
+    try:
+        from player_model.config import PROP_LEAGUES
+        from player_model.api_football import find_fixture_id, get_fixture_player_stats, get_fixture_status
+    except ImportError:
+        log.warning("player_model not importable — cannot resolve player results")
+        return
+
+    import os
+    if not os.getenv("APIFOOTBALL_KEY", ""):
+        log.info("APIFOOTBALL_KEY not set — skipping player prop resolution")
+        return
+
+    # Cache: fixture_id and full stats per (home, away, date)
+    fixture_cache: dict[str, int | None]   = {}  # cache_key → fixture_id (None = not FT)
+    stats_cache:   dict[str, dict]         = {}  # cache_key → {norm_name: stats}
+    updates: list[dict] = []
+
+    for idx, row in pending.iterrows():
+        home      = row["home_team"]
+        away      = row["away_team"]
+        date_str  = row["match_date"]
+        league    = row["league"]
+        market    = row["market"]
+        player    = row["player_name"]
+        cache_key = f"{home}|{away}|{date_str}"
+
+        league_id = PROP_LEAGUES.get(league)
+        if not league_id:
+            log.debug(f"  {league}: no PROP_LEAGUES entry — skipping")
+            continue
+
+        yr     = int(date_str[:4])
+        # Single-year tournaments (WC=1, Euros=4, Copa America=9) use the match year directly.
+        # Club leagues that span two calendar years use yr-1 for Jan-Jun matches.
+        _SINGLE_YEAR_LEAGUES = {1, 4, 9}
+        season = str(yr) if league_id in _SINGLE_YEAR_LEAGUES else (
+            str(yr - 1) if int(date_str[5:7]) < 7 else str(yr)
+        )
+
+        # ── Step 1: look up fixture as FT (completed) ─────────────────────────
+        if cache_key not in fixture_cache:
+            fixture_cache[cache_key] = find_fixture_id(league_id, season, date_str, home, away)
+
+        fixture_id = fixture_cache[cache_key]
+
+        if fixture_id is None:
+            # Fixture not found as FT — check actual status if match is ≥1 day old
+            days_since = (datetime.utcnow().date() - pd.to_datetime(date_str).date()).days
+            if days_since >= 1:
+                status, _ = get_fixture_status(league_id, season, date_str, home, away)
+                if status in ("PST", "CANC", "ABD"):
+                    label = {"PST": "POSTPONED", "CANC": "CANCELLED", "ABD": "ABANDONED"}.get(status, status)
+                    log.info(f"  {home} vs {away} ({date_str}) — {label}, marking VOID")
+                    updates.append({"idx": idx, "is_played": "False", "result": "VOID",
+                                    "pnl": "0.0", "notes": label, "resolved_date": today_str})
+                else:
+                    log.debug(f"  {home} vs {away} ({date_str}) — status={status}, leaving pending")
+            continue
+
+        # ── Step 2: fetch all player stats for this fixture ───────────────────
+        if cache_key not in stats_cache:
+            raw = get_fixture_player_stats(fixture_id)
+            stats_cache[cache_key] = {_norm(p["player_name"]): p for p in raw if p.get("player_name")}
+
+        stats_map = stats_cache[cache_key]
+
+        # ── Step 3: find this player in the stats ─────────────────────────────
+        player_key = _norm(player)
+        stats = stats_map.get(player_key)
+        if stats is None:
+            # Fuzzy fallback: first-5-chars match
+            for k, v in stats_map.items():
+                if len(player_key) >= 5 and len(k) >= 5 and (player_key[:5] in k or k[:5] in player_key):
+                    stats = v
+                    break
+
+        if stats is None:
+            # Player not in fixture stats at all — did not play (DNP)
+            log.info(f"  {player} not found in stats for {home} vs {away} — DNP (VOID)")
+            updates.append({"idx": idx, "is_played": "True", "result": "VOID",
+                            "pnl": "0.0", "notes": "DNP", "resolved_date": today_str})
+            continue
+
+        # ── Step 4: check minutes played ──────────────────────────────────────
+        minutes = int(stats.get("minutes_played") or 0)
+        if minutes == 0:
+            log.info(f"  {player} had 0 minutes in {home} vs {away} — DNP (VOID)")
+            updates.append({"idx": idx, "is_played": "True", "result": "VOID",
+                            "pnl": "0.0", "notes": "DNP (0 min)", "resolved_date": today_str})
+            continue
+
+        # ── Step 5: resolve WIN/LOSS ──────────────────────────────────────────
+        result = _resolve_player_market(market, stats)
+        if not result:
+            continue
+
+        # AN UNPRICED ROW HAS NO P&L, BECAUSE THERE WAS NO BET. This fell back to
+        # `mkt_odds = 1.0`, which prices a win at 0.0 and a loss at -1.0 — so a prop nobody
+        # could have backed lost a unit and could never gain one. Invariant 13: most AVOID rows
+        # are "never priced", not "rejected", and `enrich_with_odds` skips them before an edge is
+        # ever computed. Measured on player_ledger since 2026-08-10: 1,158 graded losses carried
+        # a pnl but only 343 of them had a price, against 175 wins that all did — 815 rows
+        # charged a unit on a bet that did not exist, and the file reported AVOID at -967u.
+        #
+        # It never touched real P&L (AVOID is not staked, and props are paper by invariant 2),
+        # but it makes the ledger useless for the one question it could answer: how the model
+        # did on the props it rejected.
+        #
+        # The RESULT is still recorded — whether the prop hit is real information and costs
+        # nothing to keep. Only the money column is left empty, per invariant 9: write NaN,
+        # never an invented number.
+        try:
+            mkt_odds = float(row["market_odds"])
+        except (TypeError, ValueError):
+            mkt_odds = None
+        if mkt_odds is None or not mkt_odds > 1.0:
+            pnl, note = "", "unpriced — result only, no stake"
+        else:
+            pnl = round(mkt_odds - 1.0, 4) if result == "WIN" else -1.0
+            note = ""
+
+        updates.append({"idx": idx, "is_played": "True", "result": result,
+                        "pnl": pnl, "notes": note, "resolved_date": today_str})
+        # `pnl` is DELIBERATELY "" for an unpriced row (see the note above — invariant 9, write
+        # nothing rather than an invented number). This log line still formatted it with
+        # `:+.3f`, so the first unpriced prop raised
+        #     ValueError: Unknown format code 'f' for object of type 'str'
+        # and killed the whole process. Per invariant 13 most props are never priced, so it hit
+        # on essentially every run: update_results failed 10 times consecutively between
+        # 2026-09-06 19:26 and 2026-09-08, and because the commit step had no `if: always()` the
+        # O/U settlements that had ALREADY succeeded in the same run were discarded with the
+        # runner each time.
+        #
+        # Formatted defensively rather than by reverting the "" — the data decision was right;
+        # only its rendering was wrong.
+        pnl_txt = f"{pnl:+.3f}u" if isinstance(pnl, (int, float)) else "n/a (unpriced)"
+        log.info(
+            f"  {'[DRY]' if dry_run else '[ OK]'} "
+            f"{player} ({market}, {minutes}min) {home} vs {away} ({date_str}) → {result}  "
+            f"PnL={pnl_txt}"
+        )
+
+    if not updates:
+        log.info("  No player prop results resolved.")
+        return
+
+    if dry_run:
+        voids   = sum(1 for u in updates if u["result"] == "VOID")
+        wins    = sum(1 for u in updates if u["result"] == "WIN")
+        losses  = sum(1 for u in updates if u["result"] == "LOSS")
+        print(f"\n  [DRY RUN] Would update {len(updates)} player prop row(s): "
+              f"{wins}W / {losses}L / {voids} VOID. No files written.")
+        return
+
+    resolved_today = today_str
+    for u in updates:
+        ledger.at[u["idx"], "is_played"]     = u["is_played"]
+        ledger.at[u["idx"], "result"]        = u["result"]
+        ledger.at[u["idx"], "pnl"]           = str(u["pnl"])
+        ledger.at[u["idx"], "notes"]         = u.get("notes", "")
+        ledger.at[u["idx"], "resolved_date"] = u["resolved_date"]
+
+    ledger.to_csv(PLAYER_LEDGER_FILE, index=False)
+
+    wins      = sum(1 for u in updates if u["result"] == "WIN")
+    losses    = sum(1 for u in updates if u["result"] == "LOSS")
+    voids     = sum(1 for u in updates if u["result"] == "VOID")
+    # Unpriced rows carry pnl "" and are excluded from the total — summing them as 0.0 would
+    # quietly restate "no bet existed" as "a bet that broke even".
+    staked    = [u for u in updates if u["result"] != "VOID" and str(u["pnl"]) != ""]
+    unpriced  = sum(1 for u in updates if str(u["pnl"]) == "")
+    total_pnl = sum(float(u["pnl"]) for u in staked)
+    log.info(f"player_ledger: {len(updates)} resolved — {wins}W / {losses}L / {voids} VOID — "
+             f"PnL={total_pnl:+.3f}u over {len(staked)} priced row(s)"
+             + (f"; {unpriced} unpriced row(s) graded with no P&L" if unpriced else ""))
+    log.info(f"  Saved → {PLAYER_LEDGER_FILE}")
+
+
+# ── Sharp money result resolver ───────────────────────────────────────────────
+
+def _resolve_sharp_side(side: str, home_score: int, away_score: int) -> str:
+    """Determine WIN/LOSS for a sharp money signal given the final score."""
+    total = home_score + away_score
+    if side == "OVER":
+        return "WIN" if total > 2.5 else "LOSS"
+    if side == "UNDER":
+        return "WIN" if total <= 2.5 else "LOSS"
+    if side == "HOME":
+        return "WIN" if home_score > away_score else "LOSS"
+    if side == "AWAY":
+        return "WIN" if away_score > home_score else "LOSS"
+    if side == "DRAW":
+        return "WIN" if home_score == away_score else "LOSS"
+    return ""
+
+
+def update_sharp_results(days: int = 3, dry_run: bool = False) -> None:
+    """Resolve sharp money tip outcomes in sharp_ledger.csv."""
+    if not SHARP_LEDGER_FILE.exists():
+        log.info("sharp_ledger.csv not found — skipping sharp money resolution")
+        return
+
+    ledger = pd.read_csv(SHARP_LEDGER_FILE, dtype=str)
+    today_str = str(datetime.utcnow().date())
+    pending_mask = (
+        ledger["result"].isna() | (ledger["result"].str.strip() == "")
+    ) & (ledger["match_date"] < today_str)
+    pending = ledger[pending_mask].copy()
+
+    if pending.empty:
+        log.info("sharp_ledger: no pending sharp money results")
+        return
+
+    log.info(f"sharp_ledger: {len(pending)} pending tip(s) to resolve")
+
+    scores_cache: dict[str, list[dict]] = {}
+    updates: list[dict] = []
+
+    for idx, row in pending.iterrows():
+        league   = row["league"]
+        home     = row["home_team"]
+        away     = row["away_team"]
+        date_str = row["match_date"]
+        side     = row["side"]
+
+        if not side:
+            log.debug(f"  sharp: no side parsed for {row.get('market_label', '')} — skipping")
+            continue
+
+        if league not in scores_cache:
+            if league in _FD_SOURCES:
+                log.info(f"  Fetching scores for {league} from football-data.co.uk ...")
+                scores_cache[league] = fetch_scores_fd(league)
+            else:
+                sk = config.ODDS_API_SPORT_KEYS.get(league)
+                if sk:
+                    log.info(f"  Fetching scores for {league} ({sk}) last {days} days ...")
+                    scores_cache[league] = fetch_scores(sk, days)
+                    log.info(f"    → {len(scores_cache[league])} completed events")
+                else:
+                    scores_cache[league] = []
+
+        completed = scores_cache.get(league, [])
+        match_result = None
+        for ev in completed:
+            if ev["date_str"] != date_str:
+                continue
+            if not (_names_match(home, ev["home_team"]) and _names_match(away, ev["away_team"])):
+                continue
+            match_result = _resolve_sharp_side(side, ev["home_score"], ev["away_score"])
+            break
+
+        if match_result is None:
+            log.debug(f"  sharp: {home} vs {away} {date_str} not found in scores")
+            continue
+
+        try:
+            opening_odds = float(row["opening_odds"])
+        except (TypeError, ValueError):
+            opening_odds = 1.0
+        pnl = round(opening_odds - 1.0, 4) if match_result == "WIN" else -1.0
+
+        updates.append({"idx": idx, "result": match_result, "pnl": pnl})
+        log.info(
+            f"  {'[DRY]' if dry_run else '[ OK]'} "
+            f"{home} vs {away} ({side}) {date_str} → {match_result}  PnL={pnl:+.3f}u"
+        )
+
+    if not updates:
+        log.info("  No sharp money results found in any scores source.")
+        return
+
+    if dry_run:
+        print(f"\n  [DRY RUN] Would update {len(updates)} sharp row(s). No files written.")
+        return
+
+    resolved_today = str(datetime.utcnow().date())
+    for u in updates:
+        ledger.at[u["idx"], "result"]        = u["result"]
+        ledger.at[u["idx"], "pnl"]           = str(u["pnl"])
+        ledger.at[u["idx"], "resolved_date"] = resolved_today
+
+    ledger.to_csv(SHARP_LEDGER_FILE, index=False)
+
+    wins      = sum(1 for u in updates if u["result"] == "WIN")
+    losses    = sum(1 for u in updates if u["result"] == "LOSS")
+    total_pnl = sum(u["pnl"] for u in updates)
+    log.info(f"sharp_ledger: {len(updates)} resolved — {wins}W/{losses}L — PnL={total_pnl:+.3f}u")
+    log.info(f"  Saved → {SHARP_LEDGER_FILE}")
+
+
+# ── Side-market result resolver (BTTS / Over 1.5 / Over 3.5) ────────────────────
+
+def _resolve_side_market(market: str, home_score: int, away_score: int) -> str:
+    """WIN/LOSS for a side market given the final score."""
+    total = home_score + away_score
+    if market == "btts":
+        return "WIN" if (home_score > 0 and away_score > 0) else "LOSS"
+    if market == "over15":
+        return "WIN" if total > 1.5 else "LOSS"
+    if market == "over35":
+        return "WIN" if total > 3.5 else "LOSS"
+    return ""
+
+
+def update_side_market_results(days: int = 3, dry_run: bool = False) -> None:
+    """Resolve BTTS / Over 1.5 / Over 3.5 outcomes in side_bets_ledger.csv.
+
+    Reuses the same score sources as the O/U ledger (football-data first, OddsAPI fallback).
+    Fills result + pnl (flat 1u) AND closing_odds + clv_pct.
+
+    CLV used to be left blank here because side-market closing lines weren't captured. They
+    are now: std_odds_capture.yml writes standard BTTS/O1.5/O3.5 into
+    standard_sidemarket_odds_history.csv 3x/day, and new-format side prices land in
+    newformat_odds_history.csv — so the archives can be read the same way the O/U 2.5 path
+    reads them (2026-08-15).
+    """
+    if not SIDE_LEDGER_FILE.exists():
+        log.info("side_bets_ledger.csv not found — skipping side-market resolution")
+        return
+
+    ledger = pd.read_csv(SIDE_LEDGER_FILE, dtype=str)
+    for col in ("result", "pnl", "closing_odds", "clv_pct"):
+        if col not in ledger.columns:
+            ledger[col] = ""
+
+    today_str = str(datetime.utcnow().date())
+    pending_mask = (
+        ledger["result"].isna() | (ledger["result"].str.strip() == "")
+    ) & (ledger["match_date"] < today_str)
+    pending = ledger[pending_mask].copy()
+
+    if pending.empty:
+        log.info("side_bets_ledger: no pending side-market results")
+        return
+
+    log.info(f"side_bets_ledger: {len(pending)} pending tip(s) to resolve")
+
+    scores_cache: dict[str, list[dict]] = {}
+    updates: list[dict] = []
+
+    for idx, row in pending.iterrows():
+        league   = row["league"]
+        home     = row["home_team"]
+        away     = row["away_team"]
+        date_str = row["match_date"]
+        market   = str(row.get("market", ""))
+
+        if league not in scores_cache:
+            if league in _FD_SOURCES:
+                log.info(f"  Fetching scores for {league} from football-data.co.uk ...")
+                scores_cache[league] = fetch_scores_fd(league)
+            else:
+                sk = config.ODDS_API_SPORT_KEYS.get(league)
+                scores_cache[league] = fetch_scores(sk, days) if sk else []
+
+        def _match(events):
+            for ev in events:
+                if ev["date_str"] == date_str and _names_match(home, ev["home_team"]) and _names_match(away, ev["away_team"]):
+                    return ev
+            return None
+
+        # LAST RESORT: API-Football, exactly as the O/U 2.5 path does. Without it a side tip whose
+        # fixture the primary source missed (football-data lag or spelling, OddsAPI's 3-day window)
+        # stayed pending forever while the O/U tip on the same match settled: 38 BTTS/O1.5/O3.5
+        # rows since 2026-10-10 (found 2026-10-25). Lazy, so a healthy run costs no calls.
+        ev_found = _match(scores_cache.get(league, [])) or _match(fetch_scores_apifootball(league))
+        if ev_found is None:
+            continue
+
+        res = _resolve_side_market(market, ev_found["home_score"], ev_found["away_score"])
+        if not res:
+            continue
+        try:
+            odds = float(row["odds"])
+        except (TypeError, ValueError):
+            odds = 1.0
+        pnl = round(odds - 1.0, 4) if res == "WIN" else -1.0
+
+        # Closing line -> CLV, same percent convention as bets_ledger/ht_ledger.
+        # A missing closing price is normal (thin 2nd-div side markets); grade the result
+        # anyway and leave CLV blank rather than dropping the row.
+        close = _closing_for_market(home, away, date_str,
+                                    _SIDE_ARCHIVE_MARKET.get(market, market))
+        clv = np.nan
+        if not np.isnan(close) and close > 0 and odds > 0:
+            clv = round((odds - close) / close * 100.0, 2)
+
+        updates.append({"idx": idx, "result": res, "pnl": pnl,
+                        "closing_odds": close, "clv_pct": clv})
+        clv_str = f"  CLV={clv:+.1f}%" if not np.isnan(clv) else ""
+        log.info(
+            f"  {'[DRY]' if dry_run else '[ OK]'} "
+            f"{home} vs {away} ({market}) {date_str} → {res}  PnL={pnl:+.3f}u{clv_str}"
+        )
+
+    if not updates:
+        log.info("  No side-market results found in any scores source.")
+        return
+    if dry_run:
+        print(f"\n  [DRY RUN] Would update {len(updates)} side-market row(s). No files written.")
+        return
+
+    for u in updates:
+        ledger.at[u["idx"], "result"] = u["result"]
+        ledger.at[u["idx"], "pnl"]    = str(u["pnl"])
+        if not np.isnan(u["closing_odds"]):
+            ledger.at[u["idx"], "closing_odds"] = str(u["closing_odds"])
+        if not np.isnan(u["clv_pct"]):
+            ledger.at[u["idx"], "clv_pct"] = str(u["clv_pct"])
+    ledger.to_csv(SIDE_LEDGER_FILE, index=False)
+
+    wins   = sum(1 for u in updates if u["result"] == "WIN")
+    losses = sum(1 for u in updates if u["result"] == "LOSS")
+    total  = sum(u["pnl"] for u in updates)
+    log.info(f"side_bets_ledger: {len(updates)} resolved — {wins}W/{losses}L — PnL={total:+.3f}u")
+    log.info(f"  Saved → {SIDE_LEDGER_FILE}")
+
+
+def _resolve_ht(market: str, ht_home: int, ht_away: int) -> str:
+    """WIN/LOSS for a half-time O/U market given the HT score."""
+    tot = int(ht_home or 0) + int(ht_away or 0)
+    line = 1 if "05" in market else 2          # over0.5 needs >=1 ; over1.5 needs >=2
+    over_hit = tot >= line
+    if market.startswith("ht_over"):
+        return "WIN" if over_hit else "LOSS"
+    if market.startswith("ht_under"):
+        return "WIN" if not over_hit else "LOSS"
+    return ""
+
+
+def update_ht_observations() -> None:
+    """Fill half-time scores into output/ht_observations.csv. Idempotent.
+
+    The observation log is the forward evidence base for the half-time question: model belief +
+    market price at scoring time, and what actually happened. It reuses the same score sources
+    and the same league-scoped name resolution as update_ht_results, because the two must never
+    disagree about what a fixture's half-time score was.
+    """
+    f = config.OUTPUT_DIR / "ht_observations.csv"
+    if not f.exists():
+        return
+    obs = pd.read_csv(f)
+    if obs.empty:
+        return
+    for c in ("ht_home_goals", "ht_away_goals", "ht_total_goals", "ht_over05", "ht_over15"):
+        if c not in obs.columns:
+            obs[c] = ""
+        obs[c] = obs[c].astype(object)
+    today = str(datetime.utcnow().date())
+    pending = obs[(obs["ht_total_goals"].isna()
+                   | (obs["ht_total_goals"].astype(str).str.strip() == ""))
+                  & (obs["match_date"].astype(str) < today)]
+    if pending.empty:
+        log.info("ht_observations: nothing pending")
+        return
+
+    from src.team_names import resolve as _resolve_team
+    frames = []
+    for path, ren in ((config.OUTPUT_DIR / "fd_history.parquet",
+                       {"ht_home_goals": "hh", "ht_away_goals": "ha"}),
+                      (config.OUTPUT_DIR / "af_ht_history.parquet",
+                       {"HTHG": "hh", "HTAG": "ha"})):
+        if not path.exists():
+            continue
+        try:
+            d = pd.read_parquet(path, columns=["league", "date", "home_team", "away_team",
+                                               *ren.keys()])
+            frames.append(d.rename(columns=ren))
+        except Exception:                                             # noqa: BLE001
+            pass
+    if not frames:
+        log.info("ht_observations: no score source available")
+        return
+    ht = pd.concat(frames, ignore_index=True).dropna(subset=["hh", "ha"])
+    ht["_d"] = ht["date"].astype(str).str[:10]
+    by = {k: g for k, g in ht.groupby(["_d", "league"], sort=False)}
+
+    filled = 0
+    for i in pending.index:
+        g = by.get((str(obs.at[i, "match_date"])[:10], str(obs.at[i, "league"])))
+        if g is None or g.empty:
+            continue
+        h = _resolve_team(str(obs.at[i, "home_team"]), list(g["home_team"]))
+        a = _resolve_team(str(obs.at[i, "away_team"]), list(g["away_team"]))
+        if not h or not a:
+            continue
+        m = g[(g["home_team"] == h) & (g["away_team"] == a)]
+        if len(m) != 1:
+            continue          # ambiguous -> leave it, a wrong score is worse than a late one
+        hh, ha = float(m.iloc[0]["hh"]), float(m.iloc[0]["ha"])
+        obs.at[i, "ht_home_goals"] = hh
+        obs.at[i, "ht_away_goals"] = ha
+        obs.at[i, "ht_total_goals"] = hh + ha
+        obs.at[i, "ht_over05"] = 1.0 if (hh + ha) >= 1 else 0.0
+        obs.at[i, "ht_over15"] = 1.0 if (hh + ha) >= 2 else 0.0
+        filled += 1
+
+    if filled:
+        obs.to_csv(f, index=False)
+    log.info(f"ht_observations: filled {filled} of {len(pending)} pending -> {f.name}")
+
+
+def update_ht_results(days: int = 3) -> None:
+    """Grade ht_ledger.csv against actual HT scores and fill
+    entry/closing/CLV from the captured HT odds (standard_sidemarket_odds_history ht_* markets).
+    Completes the open->close->CLV->result loop for the HT model. HT closing odds may be absent
+    (books don't always post 2nd-div HT O/U) -> CLV stays blank there, result still grades."""
+    import re
+    f = config.OUTPUT_DIR / "ht_ledger.csv"
+    if not f.exists():
+        log.info("ht_ledger.csv not found — skipping HT resolution"); return
+    led = pd.read_csv(f)
+    # `notes` belongs in this list too. An all-empty column reads back as float64, so writing a
+    # string into it raises TypeError and the whole grading run dies after doing its work but
+    # before saving -- which looks exactly like "nothing to grade".
+    for c in ("entry_odds", "closing_odds", "clv_pct", "result", "pnl", "notes"):
+        if c not in led.columns:
+            led[c] = ""
+        led[c] = led[c].astype(object)           # avoid pyarrow-string write crash
+    today = str(datetime.utcnow().date())
+    pending = led[(led["result"].isna() | (led["result"].astype(str).str.strip() == ""))
+                  & (led["match_date"].astype(str) < today)]
+    if pending.empty:
+        log.info("ht_ledger: no pending HT results"); return
+
+    _norm = lambda s: re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+    # ── HT SCORES COME FROM BOTH STORES, AND THE STANDARD ONE IS THE IMPORTANT ONE ──────
+    # This used to read af_ht_history.parquet ALONE and match on a bare alphanumeric key. Both
+    # halves of that were wrong, and together they meant the HT model was NEVER GRADED ONCE:
+    #
+    #   * af_ht_history holds only NEW-FORMAT leagues — MLS, Argentina, Brazil, Japan, K-League
+    #     and so on. HT tips are STANDARD-only (League One, League Two, La Liga 2). The league
+    #     overlap between the two sets is EMPTY, so no row could ever match. It was also stale
+    #     from 2026-06-23, but that was the lesser problem: fixing the date would have fixed
+    #     nothing.
+    #   * fd_history.parquet has carried `ht_home_goals` / `ht_away_goals` all along — 21,840
+    #     rows, current to yesterday, covering exactly Championship / League One / League Two /
+    #     La Liga 2. The data was sitting there the whole time.
+    #   * And a bare `_norm` key cannot join these sources anyway, because club names differ
+    #     between them (invariant 11): the ledger says `Plymouth Argyle`, `Wycombe Wanderers`,
+    #     `Accrington Stanley`; football-data says `Plymouth`, `Wycombe`, `Accrington`. Swapping
+    #     the source alone lifted matching only 0 -> 2 of 47. Resolving names LEAGUE-SCOPED with
+    #     team_names.resolve lifts it to 38 of 47; the remaining 9 are fixtures football-data has
+    #     not published yet and they grade on the next run.
+    #
+    # Both stores are read, so new-format HT coverage keeps working if it is ever tipped.
+    from src.team_names import resolve as _resolve_team
+
+    _frames = []
+    _fdp = config.OUTPUT_DIR / "fd_history.parquet"
+    if _fdp.exists():
+        try:
+            _fd = pd.read_parquet(_fdp, columns=["league", "date", "home_team", "away_team",
+                                                 "ht_home_goals", "ht_away_goals"])
+            _frames.append(_fd.rename(columns={"ht_home_goals": "hh", "ht_away_goals": "ha"}))
+        except Exception as e:                                        # noqa: BLE001
+            log.warning(f"ht_ledger: could not read fd_history.parquet ({e})")
+    _afp = config.OUTPUT_DIR / "af_ht_history.parquet"
+    if _afp.exists():
+        try:
+            _af = pd.read_parquet(_afp, columns=["league", "date", "home_team", "away_team",
+                                                 "HTHG", "HTAG"])
+            _frames.append(_af.rename(columns={"HTHG": "hh", "HTAG": "ha"}))
+        except Exception as e:                                        # noqa: BLE001
+            log.warning(f"ht_ledger: could not read af_ht_history.parquet ({e})")
+    if not _frames:
+        log.info("ht_ledger: no HT score source available — cannot grade yet"); return
+
+    ht = pd.concat(_frames, ignore_index=True).dropna(subset=["hh", "ha"])
+    ht["_d"] = ht["date"].astype(str).str[:10]
+    # Group once, so the per-row lookup is a dict hit and not a scan of 21,000 rows.
+    _by_day = {k: g for k, g in ht.groupby(["_d", "league"], sort=False)}
+
+    def _ht_score(league: str, home: str, away: str, day: str):
+        """HT goals for one fixture, or None. League-scoped so a name can't cross competitions."""
+        g = _by_day.get((day, str(league)))
+        if g is None or g.empty:
+            return None
+        h = _resolve_team(home, list(g["home_team"]))
+        a = _resolve_team(away, list(g["away_team"]))
+        if not h or not a:
+            return None
+        m = g[(g["home_team"] == h) & (g["away_team"] == a)]
+        # Exactly one, or nothing. An ambiguous match is not graded — a wrong settlement is far
+        # worse than a late one.
+        return (m.iloc[0]["hh"], m.iloc[0]["ha"]) if len(m) == 1 else None
+
+    # ── THE ODDS JOIN NEEDS THE SAME NAME RESOLUTION, for the same reason ───────────────
+    # The captured prices are real and plentiful — 4,478 ht_* rows, all four lines, 250 on a
+    # single match day — but they are written from the OddsAPI event name while the ledger
+    # carries the predict-side name, and the two disagree exactly as invariant 11 says they
+    # will: `Accrington ST` against `Accrington Stanley`, `Cheltenham` against `Cheltenham
+    # Town`. Matching those with `_norm` found entry odds for 4 of 38 graded tips, so almost
+    # every settlement fell back to the model's OWN fair odds — which makes the P/L circular
+    # and close to meaningless. Resolve league-scoped, like the scores above.
+    ohp = config.OUTPUT_DIR / "standard_sidemarket_odds_history.csv"
+    oh_by_day: dict = {}
+    if ohp.exists():
+        try:
+            oh = pd.read_csv(ohp).sort_values("snapshot_ts")
+            oh = oh[oh["market"].astype(str).str.startswith("ht_")]
+            mm = oh["match"].astype(str)
+            oh["_h"] = mm.apply(lambda m: m.split(" vs ")[0].strip() if " vs " in m else "")
+            oh["_a"] = mm.apply(lambda m: m.split(" vs ")[1].strip() if " vs " in m else "")
+            oh["_dk"] = oh["match_date"].astype(str).str[:10]
+            oh_by_day = {k: g for k, g in oh.groupby(["_dk", "league"], sort=False)}
+        except Exception as e:                                        # noqa: BLE001
+            log.warning(f"ht_ledger: could not read side-market odds ({e})")
+            oh_by_day = {}
+
+    def _ht_odds(league: str, home: str, away: str, day: str, market: str):
+        """(entry, close) for one fixture+line, or (None, None). Opening and closing price."""
+        g = oh_by_day.get((day, str(league)))
+        if g is None or g.empty:
+            return None, None
+        h = _resolve_team(home, list(g["_h"]))
+        a = _resolve_team(away, list(g["_a"]))
+        if not h or not a:
+            return None, None
+        m = g[(g["_h"] == h) & (g["_a"] == a) & (g["market"].astype(str) == market)]
+        if m.empty:
+            return None, None
+        try:
+            # Already sorted by snapshot_ts: first row is the open, last is the close.
+            return float(m.iloc[0]["odds"]), float(m.iloc[-1]["odds"])
+        except (TypeError, ValueError):
+            return None, None
+
+    graded = 0
+    for i in pending.index:
+        home = led.at[i, "home_team"]; away = led.at[i, "away_team"]
+        d = str(led.at[i, "match_date"])[:10]; mkt = str(led.at[i, "market"])
+        sc = _ht_score(led.at[i, "league"], home, away, d)
+        if sc is None:
+            continue
+        res = _resolve_ht(mkt, sc[0], sc[1])
+        if not res:
+            continue
+        entry, close = _ht_odds(led.at[i, "league"], home, away, d, mkt)
+        try:
+            fair = float(led.at[i, "fair_odds"])
+        except (TypeError, ValueError):
+            fair = 1.0
+        stake_odds = entry or close or fair or 1.0   # settle at ENTRY (open), like main/side ledgers
+        led.at[i, "result"] = res
+        led.at[i, "pnl"] = round(stake_odds - 1.0, 3) if res == "WIN" else -1.0
+        # MARK THE CIRCULAR ONES. With no captured price this settles at the model's OWN fair
+        # odds (1/p), so a win returns exactly what the model implied and the P/L measures
+        # nothing about the market — it only restates the model's confidence. Summing those
+        # rows into a headline P/L would invent a market result that was never available. The
+        # flag lets a reader split real-price rows from fair-price ones instead of guessing.
+        if not entry and not close:
+            led.at[i, "notes"] = "settled_at_fair_odds_no_market_price"
+        if entry:
+            led.at[i, "entry_odds"] = entry
+        if close:
+            led.at[i, "closing_odds"] = close
+        if entry and close and close > 1.0:
+            led.at[i, "clv_pct"] = round((entry / close - 1.0) * 100.0, 2)   # PERCENT, like bets_ledger
+        graded += 1
+
+    if graded:
+        led.to_csv(f, index=False)
+    log.info(f"ht_ledger: graded {graded} HT tip(s) → {f}")
+
+
+# ── Live in-play signal grader ────────────────────────────────────────────────
+# The Live Center "History" tab shows the scanner's in-play signals and whether they'd have
+# won. Nothing was writing those results back — the page tried to settle on-the-fly against the
+# match DB, which has no current-season new-format scores (af_history.parquet stops 2025). This
+# grader fills result/final_total/ht_total into output/live_signals_history.csv. ISOLATION:
+# touches only that file + its own score fetches; no model, no other ledger.
+
+def _live_side_from_bet(bet: str):
+    """Map a live-signal bet string -> settlement side (OVER/UNDER/HT_*), or None."""
+    b = str(bet).upper()
+    if "HT" in b:
+        if "OVER 0.5"  in b: return "HT_OVER_0.5"
+        if "UNDER 0.5" in b: return "HT_UNDER_0.5"
+        if "OVER 1.5"  in b: return "HT_OVER_1.5"
+        if "UNDER 1.5" in b: return "HT_UNDER_1.5"
+        return None
+    if "OVER 2.5"  in b: return "OVER"
+    if "UNDER 2.5" in b: return "UNDER"
+    return None
+
+
+def _settle_live(side, ft_total, ht_total):
+    """WIN/LOSS for a live signal given final + half-time totals (None if not gradable yet)."""
+    if side is None:
+        return None
+    if side.startswith("HT_"):
+        if ht_total is None or pd.isna(ht_total):
+            return None
+        if side == "HT_OVER_0.5":  return "WIN" if ht_total >= 1 else "LOSS"
+        if side == "HT_UNDER_0.5": return "WIN" if ht_total < 1  else "LOSS"
+        if side == "HT_OVER_1.5":  return "WIN" if ht_total >= 2 else "LOSS"
+        if side == "HT_UNDER_1.5": return "WIN" if ht_total <= 1 else "LOSS"
+        return None
+    if ft_total is None or pd.isna(ft_total):
+        return None
+    if side == "OVER":  return "WIN" if ft_total > 2.5  else "LOSS"
+    if side == "UNDER": return "WIN" if ft_total <= 2.5 else "LOSS"
+    return None
+
+
+def _date_variants(d: str) -> list:
+    """[d, d-1, d+1] — kickoffs can land a day either side of the signal date in UTC."""
+    try:
+        base = datetime.strptime(str(d)[:10], "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return [str(d)[:10]]
+    from datetime import timedelta
+    return [(base + timedelta(days=off)).strftime("%Y-%m-%d") for off in (0, -1, 1)]
+
+
+def update_live_signal_results(days: int = 3, dry_run: bool = False) -> None:
+    """Grade output/live_signals_history.csv so the Live Center History tab shows win/loss.
+    Sources, cheap-first: football-data.co.uk (free, FT + HT for standard) and af_ht_history
+    (free HT) -> API-Football per fixture for whatever's still missing (the only current source
+    for Argentina/Brazil FT+HT). Writes final_total/ht_total/result. Idempotent: only rows
+    without a WIN/LOSS and with a past date are (re)graded."""
+    f = config.OUTPUT_DIR / "live_signals_history.csv"
+    if not f.exists():
+        log.info("live_signals_history.csv not found — skipping live-signal resolution"); return
+    hist = pd.read_csv(f)
+    if hist.empty or "match" not in hist.columns:
+        log.info("live_signals: nothing to grade"); return
+    for c in ("final_total", "ht_total", "result"):
+        if c not in hist.columns:
+            hist[c] = ""
+        hist[c] = hist[c].astype(object)          # avoid pyarrow-string write crash
+
+    today_str = str(datetime.utcnow().date())
+    def _pending(r):
+        res = str(r.get("result", "")).strip().upper()
+        return res not in ("WIN", "LOSS") and str(r.get("date", ""))[:10] < today_str
+    pending_idx = [i for i in hist.index if _pending(hist.loc[i])]
+    if not pending_idx:
+        log.info("live_signals: no pending results"); return
+    log.info(f"live_signals: {len(pending_idx)} pending signal(s) to resolve")
+
+    # free source 1: football-data.co.uk (per league, cached in-memory this run)
+    fd_cache: dict = {}
+    def _fd_completed(league):
+        if league not in _FD_SOURCES:
+            return []
+        if league not in fd_cache:
+            fd_cache[league] = fetch_scores_fd(league)
+        return fd_cache[league]
+
+    # free source 2: af_ht_history.parquet (half-time totals, mostly older new-format matches)
+    ht_idx: dict = {}
+    htp = config.OUTPUT_DIR / "af_ht_history.parquet"
+    if htp.exists():
+        try:
+            _ht = pd.read_parquet(htp, columns=["home_team", "away_team", "date", "HTHG", "HTAG"])
+            ht_idx = {(_norm(r.home_team), _norm(r.away_team), str(r.date)[:10]): (r.HTHG, r.HTAG)
+                      for r in _ht.itertuples(index=False)}
+        except Exception as e:
+            log.debug(f"live_signals: HT parquet read failed: {e}")
+
+    # paid source: API-Football per-fixture (current FT + HT for all leagues)
+    import os
+    af_ok = bool(os.getenv("APIFOOTBALL_KEY", ""))
+    try:
+        from player_model.api_football import get_fixture_goals
+    except Exception:
+        get_fixture_goals = None
+
+    graded = 0
+    for i in pending_idx:
+        row = hist.loc[i]
+        m = str(row.get("match", ""))
+        if " vs " not in m:
+            continue
+        home, away = [s.strip() for s in m.split(" vs ", 1)]
+        d = str(row.get("date", ""))[:10]
+        league = str(row.get("league", ""))
+        side = _live_side_from_bet(row.get("bet", ""))
+        if side is None:
+            continue
+        variants = _date_variants(d)
+
+        ft_total = ht_total = None
+        # 1) football-data (free) — FT (+HT for standard leagues)
+        for ev in _fd_completed(league):
+            if ev["date_str"] in variants and _names_match(home, ev["home_team"]) and _names_match(away, ev["away_team"]):
+                ft_total = ev["home_score"] + ev["away_score"]
+                if "ht_home" in ev:
+                    ht_total = ev.get("ht_home", 0) + ev.get("ht_away", 0)
+                break
+        # 2) HT parquet (free) — new-format half-time fallback
+        if ht_total is None:
+            for dd in variants:
+                sc = ht_idx.get((_norm(home), _norm(away), dd))
+                if sc is not None and pd.notna(sc[0]) and pd.notna(sc[1]):
+                    ht_total = int(sc[0]) + int(sc[1]); break
+        # 3) API-Football — the only current source for Argentina/Brazil FT+HT
+        need_ft = ft_total is None and not side.startswith("HT_")
+        need_ht = ht_total is None and side.startswith("HT_")
+        if (need_ft or need_ht) and af_ok and get_fixture_goals is not None:
+            lg_id  = config.API_FOOTBALL_IDS.get(league)
+            season = config.API_FOOTBALL_SEASONS.get(league)
+            if lg_id and season:
+                for dd in variants:
+                    try:
+                        g = get_fixture_goals(lg_id, season, dd, home, away)
+                    except Exception as e:
+                        g = None
+                        log.debug(f"live_signals: AF fetch failed {home} v {away} {dd}: {e}")
+                    if g is not None:
+                        fth, fta, hth, hta = g
+                        if ft_total is None:
+                            ft_total = fth + fta
+                        if ht_total is None and hth is not None and hta is not None:
+                            ht_total = hth + hta
+                        break
+
+        res = _settle_live(side, ft_total, ht_total)
+        if res is None:
+            continue
+        if ft_total is not None:
+            hist.at[i, "final_total"] = int(ft_total)
+        if ht_total is not None:
+            hist.at[i, "ht_total"] = int(ht_total)
+        hist.at[i, "result"] = res
+        graded += 1
+        log.info(f"  {'[DRY]' if dry_run else '[ OK]'} {home} vs {away} ({d}) "
+                 f"{row.get('bet')}  FT={ft_total} HT={ht_total}  → {res}")
+
+    if graded and not dry_run:
+        hist.to_csv(f, index=False)
+    log.info(f"live_signals: graded {graded} signal(s) → {f}")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+# ── Prospective shadow log settlement (P0 2026-10-20) ────────────────────────────────────────
+#
+# output/v91_shadow.csv had 641 frozen predictions and ZERO settled rows: nothing in the estate
+# ever wrote its result/closing_odds/clv columns, and its rows carried only an OddsAPI event id,
+# so no results source could be joined to them. The grading logic lives in
+# src/shadow_settlement.py (pure, tested); this function only supplies it with the SAME result
+# hierarchy and odds archives the ledgers above use.
+
+SHADOW_FILE  = config.OUTPUT_DIR / "v91_shadow.csv"
+SHADOW_HEALTH_FILE = config.OUTPUT_DIR / "shadow_settlement_health.json"
+
+
+def _read_shadow(path: Path) -> tuple[pd.DataFrame, str]:
+    """dtype=str + no NA parsing, so every untouched cell is written back byte-for-byte."""
+    raw = path.read_bytes()
+    eol = "\r\n" if b"\r\n" in raw[:4096] else "\n"
+    return pd.read_csv(path, dtype=str, keep_default_na=False), eol
+
+
+def _write_shadow(df: pd.DataFrame, path: Path, eol: str) -> None:
+    tmp = path.with_suffix(".csv.tmp")
+    df.to_csv(tmp, index=False, lineterminator=eol)
+    tmp.replace(path)
+
+
+def _shadow_identity() -> dict:
+    """fixture_id -> (home, away) for rows written before the identity columns existed.
+
+    Two sources, both already in the repo: the current predictions.csv (its `_oa_event_id` is
+    exactly what `_log_shadow` stored as fixture_id), and the natural-key fallback
+    `date|home|away` that `_log_shadow` uses when a fixture had no OddsAPI event. Anything else
+    is identified by the OddsAPI scores feed's own event id inside the settlement.
+    """
+    out: dict = {}
+    p = config.OUTPUT_DIR / "predictions.csv"
+    if p.exists():
+        try:
+            pr = pd.read_csv(p, dtype=str, usecols=lambda c: c in (
+                "_oa_event_id", "home_team", "away_team"))
+            for fid, h, a in zip(pr.get("_oa_event_id", []), pr["home_team"], pr["away_team"]):
+                if isinstance(fid, str) and fid.strip():
+                    out.setdefault(fid.strip(), (h, a))
+        except Exception as e:                                        # noqa: BLE001
+            log.warning(f"shadow identity: predictions.csv unreadable ({e})")
+    return out
+
+
+def _write_shadow_health(df: pd.DataFrame, pending: dict | None = None,
+                         archives: list | None = None, now=None) -> dict:
+    from src.shadow_settlement import health
+    h = health(df, pending=pending)
+    SHADOW_HEALTH_FILE.write_text(json.dumps(h, indent=2) + "\n", encoding="utf-8")
+    _write_clv_collection_health(df, archives, now)
+    return h
+
+
+def _archives_with_heartbeats() -> list:
+    """The ledgers' archives with each capture's last-seen heartbeat folded into its change-log
+    (src/odds_heartbeat.py). A heartbeat row is an ordinary pre-kickoff observation, so the close
+    becomes the latest time the capture actually SAW the price, not the time it last moved."""
+    from src import odds_heartbeat
+    archives = list(zip(_ARCHIVE_FILES, _load_archives_named()))
+    try:
+        return odds_heartbeat.merge_into_archives(archives, odds_heartbeat.load())
+    except Exception as e:                                            # noqa: BLE001
+        log.warning(f"shadow: heartbeat merge skipped ({e})")
+        return archives
+
+
+def _write_clv_collection_health(df: pd.DataFrame, archives: list | None = None,
+                                 now=None) -> None:
+    """output/clv_collection_health.json - certified-close coverage. Never breaks settlement."""
+    try:
+        from src import clv_collection_health as cch
+        h = cch.build(df, archives if archives is not None else _archives_with_heartbeats(),
+                      now=now)
+        # Next to the shadow health file (so tests that redirect one redirect both).
+        cch.write(h, SHADOW_HEALTH_FILE.parent / "clv_collection_health.json")
+        log.info(f"clv health: {h['check']['status']} {h['check']['reasons']}")
+    except Exception as e:                                            # noqa: BLE001
+        log.warning(f"clv health skipped ({e})")
+
+
+def settle_shadow_predictions(days: int = 3, dry_run: bool = False,
+                              journal: str | None = None,
+                              providers: list | None = None,
+                              archives: list | None = None,
+                              now=None) -> dict:
+    """Settle finished, unsettled, genuinely-prospective rows of output/v91_shadow.csv.
+
+    Result hierarchy = the ledgers': football-data (where configured) -> OddsAPI scores (3-day
+    window, only for rows inside it, so a stranded row cannot burn OddsAPI credits every run)
+    -> API-Football. Closing price = last archived price strictly before kickoff, from the
+    ledgers' own odds archives. Grading-only columns are written; first-sight columns are hashed
+    and the write is refused if they would change.
+
+    `journal`: also write the updates as JSON there (the workflow re-applies them onto the
+    freshest origin copy of the file, so it never has to resolve a conflict with predict).
+    `providers` / `archives` / `now` exist for tests.
+    """
+    from src.shadow_settlement import apply_updates, settle_frame
+
+    if not SHADOW_FILE.exists():
+        log.info("shadow: v91_shadow.csv not found — nothing to settle")
+        return {"settled": 0}
+    df, eol = _read_shadow(SHADOW_FILE)
+
+    if providers is None:
+        def _fd(league):
+            return fetch_scores_fd(league) if league in _FD_SOURCES else []
+
+        def _oa(league):
+            sk = config.ODDS_API_SPORT_KEYS.get(league)
+            return fetch_scores(sk, days) if (sk and config.ODDS_API_KEY) else []
+
+        providers = [("football-data", _fd, None),
+                     ("oddsapi", _oa, min(days, 3)),
+                     ("api-football", fetch_scores_apifootball, None)]
+    if archives is None:
+        archives = _archives_with_heartbeats()
+
+    updates, pending = settle_frame(df, providers=providers, archives=archives,
+                                    identity=_shadow_identity(), now=now,
+                                    fallback_matcher=_names_match)
+    log.info(f"shadow: {len(updates)} row(s) settleable now; pending {pending}")
+    if dry_run:
+        return {"settled": 0, "would_settle": len(updates), "pending": pending}
+    if journal:
+        Path(journal).write_text(json.dumps(updates), encoding="utf-8")
+    if updates:
+        out, n = apply_updates(df, updates)
+    else:
+        out, n = df, 0
+    from src.shadow_settlement import enforce_close_rule
+    out, n_stale = enforce_close_rule(out)
+    if n or n_stale:
+        _write_shadow(out, SHADOW_FILE, eol)
+        log.info(f"shadow: settled {n} row(s), {n_stale} close(s) >30 min re-labelled -> {SHADOW_FILE.name}")
+    h = _write_shadow_health(out, pending, archives, now)
+    log.info(f"shadow: {h.get('settled_rows')}/{h.get('shadow_rows')} settled · close "
+             f"{h.get('valid_closing_price_pct')}% · CLV {h.get('clv_pct')}%")
+    return {"settled": n, "pending": pending, "health": h}
+
+
+def reapply_shadow_settlement(journal: str) -> int:
+    """Re-apply a journal onto whatever v91_shadow.csv is on disk now (offline, idempotent).
+
+    Used by the workflow after it resets to origin/main: predict may have appended rows since
+    this run started, and re-applying onto THAT file keeps both writers' work without any
+    side-picking merge.
+    """
+    from src.shadow_settlement import apply_updates
+    p = Path(journal)
+    if not p.exists() or not SHADOW_FILE.exists():
+        return 0
+    updates = json.loads(p.read_text(encoding="utf-8") or "[]")
+    df, eol = _read_shadow(SHADOW_FILE)
+    out, n = apply_updates(df, updates)
+    from src.shadow_settlement import enforce_close_rule
+    out, n_stale = enforce_close_rule(out)
+    if n or n_stale:
+        _write_shadow(out, SHADOW_FILE, eol)
+    _write_shadow_health(out)
+    log.info(f"shadow: re-applied {n} settlement(s) from journal")
+    return n
+
+
+def _load_archives_named() -> list:
+    """`_load_archives()` returns frames without their names; keep them aligned by re-reading
+    the same file list in the same order (missing files are skipped there, so skip here too)."""
+    frames = []
+    for name in _ARCHIVE_FILES:
+        p = config.OUTPUT_DIR / name
+        if not p.exists():
+            frames.append(None)
+            continue
+        try:
+            frames.append(pd.read_csv(p, dtype={"odds": float}, low_memory=False))
+        except Exception:                                             # noqa: BLE001
+            frames.append(None)
+    return frames
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--days",    type=int, default=3,
+                        help="How many past days to fetch scores for (default: 3)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show what would change without writing the ledger")
+    parser.add_argument("--shadow-journal", default=os.getenv("SHADOW_SETTLEMENT_JOURNAL"),
+                        help="Also write shadow settlements as JSON here (CI re-applies it)")
+    parser.add_argument("--shadow-reapply", default=None, metavar="JOURNAL",
+                        help="ONLY re-apply a shadow settlement journal to v91_shadow.csv")
+    parser.add_argument("--shadow-only", action="store_true",
+                        help="Settle only the shadow log (skip every ledger)")
+    args = parser.parse_args()
+
+    if args.shadow_reapply:
+        reapply_shadow_settlement(args.shadow_reapply)
+        return
+    if args.shadow_only:
+        settle_shadow_predictions(days=args.days, dry_run=args.dry_run,
+                                  journal=args.shadow_journal)
+        return
+
+    if not LEDGER_FILE.exists():
+        log.error(f"Ledger not found: {LEDGER_FILE}")
+        sys.exit(1)
+
+    ledger = pd.read_csv(LEDGER_FILE, dtype=str)
+
+    # Only rows with no result yet and a past match date
+    today_str = str(datetime.utcnow().date())
+    pending_mask = (
+        ledger["result"].isna() | (ledger["result"].str.strip() == "")
+    ) & (ledger["match_date"] < today_str)
+
+    pending = ledger[pending_mask].copy()
+    if pending.empty:
+        log.info("No pending bets_ledger results to fill in.")
+    else:
+        log.info(f"Found {len(pending)} tip(s) with missing results (match_date < {today_str})")
+
+    # Fetch scores — FD first (free), OddsAPI as fallback when FD is stale
+    scores_cache: dict[str, list[dict]] = {}
+    for league in pending["league"].unique():
+        if league in _FD_SOURCES:
+            log.info(f"  Fetching scores for {league} from football-data.co.uk ...")
+            fd_results = fetch_scores_fd(league)
+            scores_cache[league] = fd_results
+
+            # Fall back to OddsAPI only for RECENT missing dates (within args.days)
+            from datetime import timedelta
+            cutoff = (datetime.utcnow() - timedelta(days=args.days)).strftime("%Y-%m-%d")
+            pending_dates = set(pending[
+                (pending["league"] == league) & (pending["match_date"] >= cutoff)
+            ]["match_date"].tolist())
+            fd_dates = {ev["date_str"] for ev in fd_results}
+            missing_dates = {d for d in pending_dates if d not in fd_dates}
+            if missing_dates and config.ODDS_API_SPORT_KEYS.get(league):
+                sport_key = config.ODDS_API_SPORT_KEYS[league]
+                log.info(f"  FD missing dates {missing_dates} — falling back to OddsAPI...")
+                api_results = fetch_scores(sport_key, args.days)
+                log.info(f"    → OddsAPI returned {len(api_results)} completed events")
+                scores_cache[league] = fd_results + api_results
+            continue
+
+        sport_key = config.ODDS_API_SPORT_KEYS.get(league)
+        if not sport_key:
+            log.info(f"  {league}: no scores source configured — skipping")
+            continue
+        if sport_key not in scores_cache:
+            log.info(f"  Fetching scores for {league} ({sport_key}) last {args.days} days ...")
+            scores_cache[sport_key] = fetch_scores(sport_key, args.days)
+            log.info(f"    → {len(scores_cache[sport_key])} completed events returned")
+
+    # Match tips to results
+    filled = 0
+    updates: list[dict] = []
+
+    for idx, row in pending.iterrows():
+        league = row["league"]
+        if league in _FD_SOURCES:
+            completed = scores_cache.get(league, [])
+        else:
+            sport_key = config.ODDS_API_SPORT_KEYS.get(league)
+            if not sport_key:
+                continue
+            completed = scores_cache.get(sport_key, [])
+        found = _find_result(
+            home=row["home_team"],
+            away=row["away_team"],
+            date_str=row["match_date"],
+            side=row["side"],
+            completed=completed,
+        )
+
+        if found is None:
+            # LAST RESORT: API-Football. Only reached when the primary source could not
+            # resolve this fixture, so a healthy run costs nothing. This is what finally
+            # settles leagues with no football-data feed once they age past OddsAPI's
+            # 3-day scores window.
+            found = _find_result(
+                home=row["home_team"],
+                away=row["away_team"],
+                date_str=row["match_date"],
+                side=row["side"],
+                completed=fetch_scores_apifootball(league),
+            )
+
+        if found is None:
+            log.debug(f"  Not found: {row['home_team']} vs {row['away_team']} ({row['match_date']})")
+            continue
+
+        result_str, total_goals, extras = found
+        try:
+            odds = float(row["odds"])
+        except (TypeError, ValueError):
+            # one malformed odds cell must not abort settlement for every other bet + the
+            # downstream side/HT/sharp/player CLV passes that run after this loop.
+            log.debug(f"  bad odds ({row.get('odds')!r}) for {row['home_team']} vs {row['away_team']} — skipping")
+            continue
+
+        if result_str == "WIN":
+            pnl = round(odds - 1.0, 4)
+        else:
+            pnl = -1.0
+
+        # Closing Line Value
+        cl = _closing_odds(row["home_team"], row["away_team"], row["match_date"], row["side"])
+        clv = round((odds - cl) / cl * 100, 2) if (not np.isnan(cl) and cl > 0) else np.nan
+
+        update = {
+            "idx":          idx,
+            "result":       result_str,
+            "pnl":          pnl,
+            "total_goals":  total_goals,
+            "closing_odds": cl,
+            "clv_pct":      clv,
+        }
+        if "ht_score" in extras:
+            update["ht_score"] = extras["ht_score"]
+        updates.append(update)
+
+        ht_str  = f"  HT={extras['ht_score']}" if "ht_score" in extras else ""
+        clv_str = f"  CLV={clv:+.1f}%" if not np.isnan(clv) else ""
+        log.info(
+            f"  {'[DRY]' if args.dry_run else '[ OK]'} "
+            f"{row['home_team']} vs {row['away_team']} "
+            f"({row['match_date']})  "
+            f"{row['side']} @ {odds}  "
+            f"Goals={total_goals}{ht_str}  → {result_str}  PnL={pnl:+.3f}u{clv_str}"
+        )
+        filled += 1
+
+    if not updates:
+        log.info("No pending matches found in any scores source. If matches were recently played, try --days with a larger value or re-run after the local CSVs are refreshed.")
+    elif args.dry_run:
+        print(f"\n  [DRY RUN] Would update {filled} row(s). No files written.")
+
+    # Write back to ledger
+    if updates and not args.dry_run:
+        if "ht_score" not in ledger.columns:
+            ledger["ht_score"] = ""
+        for u in updates:
+            ledger.at[u["idx"], "result"] = u["result"]
+            ledger.at[u["idx"], "pnl"]    = str(u["pnl"])
+            if not np.isnan(u["closing_odds"]):
+                ledger.at[u["idx"], "closing_odds"] = str(u["closing_odds"])
+            if not np.isnan(u["clv_pct"]):
+                ledger.at[u["idx"], "clv_pct"] = str(u["clv_pct"])
+            if u.get("ht_score"):
+                ledger.at[u["idx"], "ht_score"] = u["ht_score"]
+
+        ledger.to_csv(LEDGER_FILE, index=False)
+
+    if updates and not args.dry_run:
+        total_pnl  = sum(u["pnl"] for u in updates)
+        wins       = sum(1 for u in updates if u["result"] == "WIN")
+        losses     = sum(1 for u in updates if u["result"] == "LOSS")
+        clv_vals   = [u["clv_pct"] for u in updates if not np.isnan(u["clv_pct"])]
+        avg_clv    = np.mean(clv_vals) if clv_vals else np.nan
+
+        print("\n" + "=" * 60)
+        print(f"  RESULTS UPDATED — {filled} bet(s)")
+        print("=" * 60)
+        print(f"  Win  : {wins}")
+        print(f"  Loss : {losses}")
+        print(f"  PnL  : {total_pnl:+.3f} units (flat 1u stakes)")
+        if not np.isnan(avg_clv):
+            verdict = "SHARP (beat closing line)" if avg_clv > 0 else "SOFT (market moved against)"
+            print(f"  CLV  : {avg_clv:+.2f}% avg  →  {verdict}")
+
+        # Full ledger P&L if any resolved rows exist
+        all_with_result = ledger[ledger["result"].isin(["WIN", "LOSS", "VOID"])].copy()
+        if not all_with_result.empty:
+            all_with_result["pnl"] = pd.to_numeric(all_with_result["pnl"], errors="coerce")
+            total_all = all_with_result["pnl"].sum()
+            w_all = (all_with_result["result"] == "WIN").sum()
+            l_all = (all_with_result["result"] == "LOSS").sum()
+            hit   = w_all / (w_all + l_all) if (w_all + l_all) > 0 else 0
+            print()
+            print(f"  LEDGER TOTALS ({len(all_with_result)} settled bets)")
+            print(f"  Win rate : {hit:.0%}  ({w_all}W / {l_all}L)")
+            print(f"  Total PnL: {total_all:+.3f} units")
+
+        print()
+        log.info(f"Ledger saved → {LEDGER_FILE}")
+
+    # Also resolve player prop, sharp money, and side-market ledgers
+    update_player_results(days=args.days, dry_run=args.dry_run)
+    update_sharp_results(days=args.days, dry_run=args.dry_run)
+    update_side_market_results(days=args.days, dry_run=args.dry_run)
+    update_ht_results(days=args.days)
+    # Guarded: this is an EVIDENCE log, not a tipping path. If it ever throws it must not take
+    # the live-signal resolution down with it — the workflow comment above records that a crash
+    # mid-sequence leaves later ledgers ungraded.
+    try:
+        update_ht_observations()
+    except Exception as e:                                            # noqa: BLE001
+        log.warning(f"ht_observations update skipped: {e}")
+    update_live_signal_results(days=args.days, dry_run=args.dry_run)
+    # LAST and guarded, like ht_observations: an evidence log must never take a ledger down.
+    try:
+        settle_shadow_predictions(days=args.days, dry_run=args.dry_run,
+                                  journal=args.shadow_journal)
+    except Exception as e:                                            # noqa: BLE001
+        log.warning(f"shadow settlement skipped: {e}")
+
+
+if __name__ == "__main__":
+    main()
