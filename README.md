@@ -8,6 +8,6 @@ a whole. Any hand edit here is overwritten by the next build: change the code in
 * Data: NOT in this repo. `dashboard_data/remote_mirror.py` downloads the manifest's data files from
   `https://raw.githubusercontent.com/NevixAA/wowza-betting/main/<path>` into the same relative paths
   at startup and then at most every 10 minutes (the `deploy/SLIM` marker switches it on).
-* Built from v9 commit: `058da893a32a701d672bae64094753b37d6dd7e4` at 2026-10-28T11:15:22Z.
+* Built from v9 commit: `6b21a35a87d63290e8b74e4c3bbb753377b23ef4` at 2026-10-28T12:39:14Z.
 
 Full instructions: `deploy/README_DASHBOARD_DEPLOY.md`.
