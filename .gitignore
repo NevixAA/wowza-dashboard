@@ -1,6 +1,7 @@
 # GENERATED. Data below is downloaded at runtime by dashboard_data/remote_mirror.py;
 # it must never be committed to the slim repo.
 deploy/.mirror_sync.json
+deploy/.v9_manifest_at_data.json
 **/.*.tmp
 dashboard_data/_remote_cache/
 __pycache__/
