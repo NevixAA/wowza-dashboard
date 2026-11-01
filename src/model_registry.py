@@ -87,6 +87,7 @@ RETRAIN_BATCHES = LINEAGE_DIR / "retrain_batches.csv"
 HIGH_WATER = LINEAGE_DIR / "high_water_mark.json"
 
 UNKNOWN_LEGACY = "UNKNOWN_LEGACY"
+UNKNOWN_PRE_GATE_CUTOFF = "UNKNOWN_PRE_GATE"   # registered before the gate recorded training windows
 ROLES = ("CHAMPION", "CHALLENGER", "REJECTED", "SHADOW", "ARCHIVED")
 
 CHAMPION_HISTORY_COLS = [
@@ -240,15 +241,17 @@ def challenger_meta_path(model_type: str) -> Path:
     return REGISTRY_DIR / model_type / "challenger.json"
 
 
-def set_challenger(model_type: str, manifest: dict, raw: bytes) -> None:
+def set_challenger(model_type: str, manifest: dict, raw: bytes, now=None) -> None:
     """Park a SHADOW_MORE challenger where predict can score it without serving it.
 
     The slot never touches the serving file. One slot per model type: the latest SHADOW_MORE
     challenger replaces the previous one (its manifest and metrics stay in the lineage).
+    `shadow_since` (the freeze that prospective rows must postdate) uses the CALLER's clock: this
+    always took the wall clock, so the gate's own `now` and the freeze could disagree.
     """
     _atomic_write_bytes(challenger_path(model_type), gzip.compress(raw, 6))
     _atomic_write_json(challenger_meta_path(model_type),
-                       {**manifest, "model_role": "SHADOW", "shadow_since": iso(utcnow())})
+                       {**manifest, "model_role": "SHADOW", "shadow_since": iso(now or utcnow())})
 
 
 def clear_challenger(model_type: str) -> None:
@@ -299,9 +302,13 @@ def stamp_for(model_type: str, path: Path | None = None) -> dict:
             sha = sha256_file(f)
             man = _index_by_sha().get(sha)
             if man:
+                # A model registered before the promotion gate (LEGACY_PROMOTED, 126 manifests)
+                # never recorded its training window. Say so explicitly instead of leaving the
+                # field blank, which read as "not stamped" (Data Truth audit finding 48). Every
+                # gate-trained model carries its real cutoff.
                 out.update(model_version=man["model_version"],
                            retrain_batch_id=man.get("retrain_batch_id", ""),
-                           training_cutoff=man.get("training_cutoff", ""))
+                           training_cutoff=man.get("training_cutoff") or UNKNOWN_PRE_GATE_CUTOFF)
             else:
                 out["model_version"] = f"UNREGISTERED_{model_type}_{sha[:12]}"
     except Exception as e:                                             # noqa: BLE001

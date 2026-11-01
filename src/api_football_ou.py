@@ -340,12 +340,21 @@ def fetch_league_fixture_results(
     """
     Fetch completed fixture results (goals + HT) for a league/season.
     Used for Saudi Pro League, K-League 1 and any other league not on FD.
-    Permanent cache (TTL 1 year) — completed match results never change.
+    A completed result never changes, but the LIST of completed fixtures in a season still being
+    played grows every week. The 1-year cache froze the current season's list (restored across CI
+    runs by actions/cache), so its history stopped at the first fetch (Data Truth audit finding 35).
+    A finished season keeps the year; the current one (or an unknown league) is refreshed every 6 h.
 
     Returns DataFrame: date, home_team, away_team,
                        home_goals, away_goals, ht_home_goals, ht_away_goals
     """
-    data = _get("fixtures", {"league": league_id, "season": season, "status": "FT"}, ttl_h=8760)
+    ttl = 6
+    if league_name:
+        from src.season_resolver import resolve_api_season, is_known
+        cur = resolve_api_season(league_name)
+        if is_known(cur) and str(season) != str(cur):
+            ttl = 8760
+    data = _get("fixtures", {"league": league_id, "season": season, "status": "FT"}, ttl_h=ttl)
     if not data:
         return pd.DataFrame()
 
@@ -485,11 +494,14 @@ def injury_features_from_context(
 ) -> dict[str, float]:
     """
     Compute key_attacker_absent_home / _away from a pre-fetched league context.
-    Returns {key_attacker_absent_home: 0/1, key_attacker_absent_away: 0/1}.
+    Returns {key_attacker_absent_home: 0/1, key_attacker_absent_away: 0/1}, or NaN for both when
+    the injuries were not fetched or the fixture id is unresolved. That used to be 0.0 ("we
+    checked and nobody is out"), which is what all 154/154 board fixtures carried
+    (Data Truth audit finding 47).
     """
-    out = {"key_attacker_absent_home": 0.0, "key_attacker_absent_away": 0.0}
+    unknown = {"key_attacker_absent_home": float("nan"), "key_attacker_absent_away": float("nan")}
     if not ctx:
-        return out
+        return unknown
 
     home_norm = _norm_name(home_team)
     away_norm = _norm_name(away_team)
@@ -497,7 +509,8 @@ def injury_features_from_context(
 
     fix_id = ctx["fixture_ids"].get((home_norm, away_norm, date_str))
     if fix_id is None:
-        return out
+        return unknown
+    out = {"key_attacker_absent_home": 0.0, "key_attacker_absent_away": 0.0}
 
     injuries     = ctx["injuries"].get(fix_id, {})
     top_scorers  = ctx["top_scorers"]

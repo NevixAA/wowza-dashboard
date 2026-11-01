@@ -126,6 +126,11 @@ MAX_STAKE_SNIPER      = 0.03
 MAX_STAKE_MARKSMAN    = 0.02
 MAX_STAKE_VALUABLE    = 0.01
 CONFIDENCE_FLOORS     = {"SNIPER": 0.72, "MARKSMAN": 0.62, "VALUABLE": 0.50}
+# OFF (owner decision 2026-11-01, Data Truth finding 52). These floors were tuned on a score that
+# was 45% constant (+0.40 on every row) and they filtered nothing: tiers are identical with and
+# without them. The honest score carries no ranking signal yet (n_games is the 5-game window on
+# every row; lazy factors are 7% of rows). Turn ON only after floors are fitted on settled props.
+PROPS_CONFIDENCE_GATE = False
 
 # Relative edge gates — replace hard market_odds floors (5.0 / 4.0) with model-derived edge.
 # rel_edge = (model_prob - fair_prob) / fair_prob  — odds-level-agnostic measure.
@@ -416,15 +421,60 @@ def _prop_season_now() -> str:
 
     European seasons start in July, so months 7-12 belong to the year that has just begun and
     months 1-6 to the campaign that started the previous year.
+
+    SUPERSEDED for PROP_SEASONS (Data Truth audit findings 38, 41): this European rule was applied
+    to EVERY league, so J1 was '2026' while its live season is 2027, and calendar-year leagues (MLS,
+    Brazil, Argentina, Nordics, China, Ireland) would be a year behind every January-June. Kept only
+    for callers outside player_model that import it.
     """
     from datetime import date
     t = date.today()
     return str(t.year if t.month >= 7 else t.year - 1)
 
 
+def prop_season(league: str, on_date=None) -> str:
+    """API-Football season for `league` on `on_date` (default today), from the canonical
+    registry's season rules (src.season_resolver). An unknown league gives 'SEASON_UNKNOWN',
+    which API-Football answers with nothing - a visible miss, never a guessed year."""
+    return _season_resolver().resolve_api_season(league, on_date)
+
+
+_SR_FOREIGN = None      # v9's resolver, privately loaded under a foreign `src` (see below)
+
+
+def _season_resolver():
+    """v9's src.season_resolver, even when the importer has its OWN `src` package (wowzaV9-Pro
+    imports player_model from _v9/, and there `src` is Pro's - a plain import crashed Pro Live Odds
+    on 2026-11-01). A foreign `src` and sys.path are restored afterwards."""
+    import importlib
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    cur = sys.modules.get("src")
+    foreign = cur is not None and (root / "src").resolve() not in {
+        Path(p).resolve() for p in getattr(cur, "__path__", [])}
+    if not foreign:
+        if str(root) not in sys.path:
+            sys.path.append(str(root))
+        return importlib.import_module("src.season_resolver")
+    saved_path = list(sys.path)
+    saved = {k: sys.modules.pop(k) for k in list(sys.modules) if k == "src" or k.startswith("src.")}
+    sys.path.insert(0, str(root))
+    try:
+        global _SR_FOREIGN
+        if _SR_FOREIGN is None:
+            _SR_FOREIGN = importlib.import_module("src.season_resolver")
+        return _SR_FOREIGN
+    finally:
+        sys.path[:] = saved_path
+        for k in [k for k in sys.modules if k == "src" or k.startswith("src.")]:
+            sys.modules.pop(k)
+        sys.modules.update(saved)
+
+
 # One entry per league in PROP_LEAGUES, always. Never edit this by hand — add the league to
-# PROP_LEAGUES and its season appears here.
-PROP_SEASONS = {league: _prop_season_now() for league in PROP_LEAGUES}
+# PROP_LEAGUES and its season appears here. League-aware since 2026-11-01.
+PROP_SEASONS = {league: prop_season(league) for league in PROP_LEAGUES}
 FBREF_LEAGUES = {
     "Championship": (10, "Championship"), "League One": (15, "League-One"),
     "League Two": (16, "League-Two"),     "Bundesliga 2": (33, "2-Bundesliga"),

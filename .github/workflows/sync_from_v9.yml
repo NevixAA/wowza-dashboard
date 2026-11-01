@@ -1,0 +1,74 @@
+name: Sync from v9
+
+# This repo is the SLIM deployment of the Wowza dashboard. Every code file in it is a copy of a file
+# in NevixAA/wowza-betting (v9), listed in v9's deploy/dashboard_manifest.json. Hand-maintained
+# copies drifted (Data Truth audit 2026-11-01: 29 files differed from v9 main and 6 that v9's
+# manifest lists were missing, including src/integrity/data_truth.py, so System Health reported
+# "Data truth checks failed"). So the copy is now automatic:
+#
+#   1. check out v9 main read-only,
+#   2. build the slim tree with v9's OWN generator (scripts/build_dashboard_repo.py), which copies
+#      exactly the manifest's code files plus the generated README / BUILD_INFO / .gitignore,
+#   3. mirror it over this repo with --delete, so a file v9 drops from the manifest (stale,
+#      pipeline-only) disappears here too. .git and .github (this workflow) are kept,
+#   4. commit only when a code or manifest file changed. BUILD_INFO.json and README.md carry a
+#      build timestamp, so on their own they are not a reason to commit.
+#
+# Never edit files here by hand: fix them in wowza-betting and let this run (or dispatch it).
+
+on:
+  schedule:
+    - cron: '17 * * * *'      # hourly; v9 code changes a few times a day at most
+  workflow_dispatch:
+  repository_dispatch:
+    types: [v9-main-updated]
+
+concurrency:
+  group: sync-from-v9
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: slim
+
+      - name: Check out v9 main (read-only)
+        uses: actions/checkout@v4
+        with:
+          repository: NevixAA/wowza-betting
+          ref: main
+          path: _v9
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build the slim tree with v9's generator
+        run: python _v9/scripts/build_dashboard_repo.py "$RUNNER_TEMP/build"
+
+      - name: Mirror it over this repo (keep .git and .github)
+        run: rsync -a --delete --exclude '/.git' --exclude '/.github' "$RUNNER_TEMP/build/" slim/
+
+      - name: Commit if code changed
+        working-directory: slim
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet -- . ':(exclude)deploy/BUILD_INFO.json' ':(exclude)README.md'; then
+            echo "in sync with v9 main (only build stamps differ) - nothing to commit"
+            exit 0
+          fi
+          git diff --cached --stat
+          sha=$(git -C ../_v9 rev-parse --short HEAD)
+          git commit -m "Sync from v9 ${sha}: dashboard manifest files"
+          for i in 1 2 3 4 5; do git pull --rebase origin main && git push && exit 0; sleep 5; done
+          exit 1
