@@ -10,7 +10,14 @@ __pycache__/
 .streamlit/secrets.toml
 
 # whole data directories (no code file lives in them)
-/config/
 /models/
 /output/
 # individual data files
+/config/auto_leagues.json
+/config/bankroll_policy.json
+/config/league_market_regimes.json
+/config/promotion_gate.json
+/config/research_lock_snapshot.json
+/config/threshold_applied.json
+/config/threshold_approvals.json
+/config/track_registry.json
