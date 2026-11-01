@@ -55,13 +55,9 @@ log = logging.getLogger(__name__)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import config
 
-try:
-    from src.poisson import dixon_coles_p_over25 as _dc_p_over25
-except ImportError:
-    try:
-        from poisson import dixon_coles_p_over25 as _dc_p_over25
-    except ImportError:
-        _dc_p_over25 = None
+# Hard import: src/poisson.py ships with this repo. When it was optional, a failed import silently
+# replaced the model's own goal estimate with the market price (or 0.5) - data truth, 2026-11-01.
+from src.poisson import dixon_coles_p_over25 as _dc_p_over25
 
 _N = config.ROLLING_N
 
@@ -151,34 +147,40 @@ def _add_home_advantage(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     n = _N
     ha_home, ha_away = [], []
-    df_sorted = df.sort_values("date").reset_index(drop=True)
-    league_avg = df_sorted.groupby("league")["away_goals"].expanding().mean().shift(1)
-    df_sorted["league_avg_away_goals"] = league_avg.values
+    df_sorted = df.sort_values("date", kind="mergesort").reset_index(drop=True)
+    # PER LEAGUE, in row order. `groupby().expanding().mean().shift(1).values` came back GROUPED BY
+    # LEAGUE and was pasted onto date-ordered rows, so each row got another league's running
+    # average, and the shift leaked across league boundaries (Data Truth audit, found with 12).
+    df_sorted["league_avg_away_goals"] = df_sorted.groupby("league")["away_goals"].transform(
+        lambda s: s.expanding().mean().shift(1))
 
     home_ha: dict[str, float] = {}
     away_ha: dict[str, float] = {}
-    home_results: dict[str, list] = {}
+    home_results: dict[tuple, list] = {}
 
     for _, row in df_sorted.iterrows():
-        h, a = row["home_team"], row["away_team"]
-        lg_avg = row.get("league_avg_away_goals", 1.1) or 1.1
+        h, a, lg = row["home_team"], row["away_team"], row.get("league", "")
+        lg_avg = row.get("league_avg_away_goals")
 
-        # Lookup existing window
-        h_wins = home_results.get(h, [])
-        ha_home.append(float(np.mean(h_wins[-n:])) if h_wins else 0.55)
+        # No home history -> NaN, not an invented 0.55 / 0.45 (Data Truth audit finding 12); the
+        # model imputes it like any other gap, identically at serving time. Keyed by league too,
+        # so a same-named club elsewhere never contributes.
+        h_wins = home_results.get((lg, h), [])
+        ha_home.append(float(np.mean(h_wins[-n:])) if h_wins else np.nan)
 
-        a_wins = home_results.get(a, [])
-        ha_away.append(float(np.mean(a_wins[-n:])) if a_wins else 0.45)
+        a_wins = home_results.get((lg, a), [])
+        ha_away.append(float(np.mean(a_wins[-n:])) if a_wins else np.nan)
 
-        # Update after this match (shift(1) — use result for next match)
-        if not pd.isna(row.get("home_goals")):
+        # Update after this match (shift(1) — use result for next match). No league average yet
+        # (the league's first match) -> nothing to compare against, so nothing is recorded.
+        if not pd.isna(row.get("home_goals")) and pd.notna(lg_avg):
             scored = float(row["home_goals"])
-            home_results.setdefault(h, []).append(1.0 if scored > lg_avg else 0.0)
+            home_results.setdefault((lg, h), []).append(1.0 if scored > lg_avg else 0.0)
 
     df_sorted["home_advantage"]      = ha_home
     df_sorted["away_home_adv_factor"] = ha_away
     # Restore original order
-    df_sorted = df_sorted.set_index(df.sort_values("date").index)
+    df_sorted = df_sorted.set_index(df.sort_values("date", kind="mergesort").index)
     df["home_advantage"]       = df_sorted["home_advantage"].values
     df["away_home_adv_factor"] = df_sorted["away_home_adv_factor"].values
     return df
@@ -464,9 +466,10 @@ def build_features(matches: pd.DataFrame, n: int = None, recipe: str = "legacy_v
 
     # ── HT-derived features (when available) ──────────────────────────────
     if has_ht and "home_ht_scored_last5" in df.columns:
-        df["combined_ht_goals_avg"] = (
-            df["home_ht_scored_last5"].fillna(0) + df["away_ht_scored_last5"].fillna(0)
-        )
+        # NaN when either side has no HT history - fillna(0) read "unknown" as "never scores at
+        # half-time" (48 of 154 board fixtures understated, 17 at exactly 0; Data Truth audit
+        # finding 7). Identical rule at serving time below; the model imputes it like any gap.
+        df["combined_ht_goals_avg"] = df["home_ht_scored_last5"] + df["away_ht_scored_last5"]
         if "league_avg_goals" in df.columns:
             half_avg = (df["league_avg_goals"] / 2).replace(0, np.nan)
         else:
@@ -503,9 +506,9 @@ def build_features(matches: pd.DataFrame, n: int = None, recipe: str = "legacy_v
     # Rolling team SOT ratio (leak-free: each team's avg over their last N games)
     df["home_sot_ratio_last5"] = df["home_sot_last5"] / df["home_shots_last5"].replace(0, np.nan)
     df["away_sot_ratio_last5"] = df["away_sot_last5"] / df["away_shots_last5"].replace(0, np.nan)
-    df["combined_sot_ratio"] = (
-        df["home_sot_ratio_last5"].fillna(0.35) + df["away_sot_ratio_last5"].fillna(0.33)
-    ) / 2
+    # NaN when a side has no shot history, never the invented 0.35 / 0.33 (Data Truth audit
+    # finding 12); identical at serving time.
+    df["combined_sot_ratio"] = (df["home_sot_ratio_last5"] + df["away_sot_ratio_last5"]) / 2
 
     # ── Actual SP goals from Sofascore cache ───────────────────────────────
     df = _merge_sofascore(df)
@@ -526,13 +529,14 @@ def build_features(matches: pd.DataFrame, n: int = None, recipe: str = "legacy_v
         df["implied_prob_over"] + df["implied_prob_under"] - 1.0
     ).clip(lower=0.0)
 
-    # Dixon-Coles corrected P(over 2.5) using per-team rolling goal rates as lambdas
-    if _dc_p_over25 is not None and "home_scored_last5" in df.columns:
+    # Dixon-Coles corrected P(over 2.5) using per-team rolling goal rates as lambdas; no form -> NaN
+    if "home_scored_last5" in df.columns:
         _lh = df["home_scored_last5"].clip(lower=0.3, upper=4.0)
         _la = df["away_scored_last5"].clip(lower=0.3, upper=4.0)
-        df["p_over25_poisson_dc"] = [_dc_p_over25(h, a) for h, a in zip(_lh, _la)]
+        df["p_over25_poisson_dc"] = [_dc_p_over25(h, a) if pd.notna(h) and pd.notna(a) else np.nan
+                                     for h, a in zip(_lh, _la)]
     else:
-        df["p_over25_poisson_dc"] = df["implied_prob_over"].fillna(0.5)
+        df["p_over25_poisson_dc"] = np.nan
 
     return df
 
@@ -657,15 +661,18 @@ def build_upcoming_features(
         # HT rolling features (NaN for leagues without HTHG/HTAG data)
         feat["home_ht_scored_last5"]    = _team_recent(ht, "ht_home_goals", "ht_away_goals", n, lg)
         feat["home_ht_conceded_last5"]  = _team_recent(ht, "ht_away_goals", "ht_home_goals", n, lg)
-        feat["away_ht_scored_last5"]    = _team_recent(at, "ht_home_goals", "ht_away_goals", n)
-        feat["away_ht_conceded_last5"]  = _team_recent(at, "ht_away_goals", "ht_home_goals", n)
+        # League-scoped like every other form feature. These two had no `lg` until 2026-11-01, so
+        # an away club's HT form could come from a same-named club in another league.
+        feat["away_ht_scored_last5"]    = _team_recent(at, "ht_home_goals", "ht_away_goals", n, lg)
+        feat["away_ht_conceded_last5"]  = _team_recent(at, "ht_away_goals", "ht_home_goals", n, lg)
         def _ht_rate(team, threshold, nn, league=""):
-            # League-isolated: never mix HT stats across different leagues
-            h = hist[hist["home_team"] == team]
-            a = hist[hist["away_team"] == team]
-            if league:
-                h = h[h["league"] == league]
-                a = a[a["league"] == league]
+            # League-isolated AND name-resolved: this matched the raw OddsAPI name exactly, so
+            # 'Blackburn Rovers', 'Queens Park Rangers', 'Cardiff City' (football-data: Blackburn,
+            # QPR, Cardiff) had no HT rate at all - 75-100% NaN in Championship, La Liga 2,
+            # Bundesliga 2 and League One while the same clubs' goal form resolved fine
+            # (Data Truth audit finding 8).
+            h = _find_team_rows(team, "home_team", league)
+            a = _find_team_rows(team, "away_team", league)
             # HALF-TIME COLUMNS ARE OPTIONAL. Indexing them directly crashed predict with
             # KeyError: 'ht_home_goals' the moment the history frame came from a source without
             # them — which is exactly what happened when the football-data.co.uk outage forced a
@@ -674,12 +681,13 @@ def build_upcoming_features(
             # feature here does; it must not take the whole tip run down.
             if not {"ht_home_goals", "ht_away_goals"} <= set(hist.columns):
                 return float("nan")
-            hm   = h["ht_home_goals"].dropna()
-            hm_t = h["ht_away_goals"].dropna()
-            aw   = a["ht_away_goals"].dropna()
-            aw_t = a["ht_home_goals"].dropna()
-            total = [(a_ + b) for a_, b in zip(list(hm.tail(nn)), list(hm_t.tail(nn)))] + \
-                    [(a_ + b) for a_, b in zip(list(aw.tail(nn)), list(aw_t.tail(nn)))]
+            # One match = both half-time scores of THAT match. Dropping NaN per column and then
+            # zipping paired one match's home HT goals with another match's away HT goals
+            # whenever a single side was missing.
+            hh = h.dropna(subset=["ht_home_goals", "ht_away_goals"]).tail(nn)
+            aa = a.dropna(subset=["ht_home_goals", "ht_away_goals"]).tail(nn)
+            total = list(hh["ht_home_goals"] + hh["ht_away_goals"]) + \
+                    list(aa["ht_home_goals"] + aa["ht_away_goals"])
             if not total:
                 return float('nan')
             return sum(1 for x in total if x >= threshold) / len(total)
@@ -735,7 +743,9 @@ def build_upcoming_features(
             _venue_season_stats(at, "away_team", "away_goals", "home_goals", lg)
 
         lg_avg_away = hist[hist["league"] == lg]["away_goals"].mean() if lg else hist["away_goals"].mean()
-        lg_avg_away = lg_avg_away if pd.notna(lg_avg_away) and lg_avg_away > 0 else 1.1
+        # No league history -> no reference average -> home-advantage features stay NaN below
+        # (was an invented 1.1; Data Truth audit finding 12).
+        _no_ref = not (pd.notna(lg_avg_away) and lg_avg_away > 0)
 
         # HOME team's rolling home advantage, computed exactly as training does
         # (_add_home_advantage: fraction of its last n home games scoring above the league's
@@ -745,15 +755,16 @@ def build_upcoming_features(
         # 91% of October's NF O/U tips into Unders (measured 2026-11-01).
         if _parity:
             ht_home_rows = _find_team_rows(ht, "home_team", lg).tail(n)
-            feat["home_advantage"] = (0.55 if ht_home_rows.empty else float(
+            feat["home_advantage"] = (np.nan if (ht_home_rows.empty or _no_ref) else float(
                 (ht_home_rows["home_goals"] > lg_avg_away).sum() / len(ht_home_rows)))
         else:
             feat["home_advantage"] = 1.0                      # pre-2026-11-01 behaviour (rollback)
 
-        # Away team's rolling home advantage (fraction of their own home games they dominate)
+        # Away team's rolling home advantage (fraction of their own home games they dominate).
+        # No history -> NaN, as in training (was an invented 0.45).
         at_home_rows = _find_team_rows(at, "home_team", lg).tail(n)
-        if at_home_rows.empty:
-            feat["away_home_adv_factor"] = 0.45
+        if at_home_rows.empty or _no_ref:
+            feat["away_home_adv_factor"] = np.nan
         else:
             feat["away_home_adv_factor"] = float(
                 (at_home_rows["home_goals"] > lg_avg_away).sum() / len(at_home_rows)
@@ -774,23 +785,41 @@ def build_upcoming_features(
     df["away_defense_str"] = df["away_conceded_last5"] / half_avg
 
     # HT strength features
-    df["combined_ht_goals_avg"] = (
-        df["home_ht_scored_last5"].fillna(0) + df["away_ht_scored_last5"].fillna(0)
-    )
+    # Same rule as training (build_features): NaN when either side is unknown, never 0.
+    df["combined_ht_goals_avg"] = df["home_ht_scored_last5"] + df["away_ht_scored_last5"]
     df["home_ht_attack_str"]  = df["home_ht_scored_last5"]   / half_avg
     df["away_ht_attack_str"]  = df["away_ht_scored_last5"]   / half_avg
     df["home_ht_defense_str"] = df["home_ht_conceded_last5"] / half_avg
     df["away_ht_defense_str"] = df["away_ht_conceded_last5"] / half_avg
 
-    # Rest days using historical
-    combined = pd.concat([
-        hist[["date", "home_team", "away_team"]].tail(1000),
-        df[["date", "home_team", "away_team"]],
-    ]).sort_values("date").reset_index(drop=True)
+    # Rest days using historical. _add_rest_days keeps its INPUT order, so the upcoming rows stay
+    # the last len(df) rows in df's own order. Sorting here first (as this did until 2026-11-01)
+    # then copying back by position handed fixtures another fixture's rest days whenever the board
+    # was not in date order (51 of 52 consistency checks failed on the committed board). History
+    # is every row involving a team on the board, not the last 1,000 rows across all leagues,
+    # which left 64% of live Standard fixtures with no rest days at all.
+    # Board names resolved to their HISTORY spelling first (league-scoped, same resolver as the form
+    # features): with raw OddsAPI names 'Blackburn Rovers', 'Queens Park Rangers'... never met
+    # football-data's 'Blackburn', 'QPR', and 36% of Standard fixtures still had no rest days.
+    def _hist_name(team, league):
+        if not league:
+            return team
+        key = (str(team), str(league))
+        if key not in _resolved:
+            _resolved[key] = resolve_team(team, _clubs_in(league))
+        return _resolved[key] or team
+    _up = df[["date", "home_team", "away_team"]].copy()
+    _lgs = df["league"] if "league" in df.columns else pd.Series("", index=df.index)
+    _up["home_team"] = [_hist_name(t, lg) for t, lg in zip(df["home_team"], _lgs)]
+    _up["away_team"] = [_hist_name(t, lg) for t, lg in zip(df["away_team"], _lgs)]
+    _teams = set(_up["home_team"]) | set(_up["away_team"])
+    _h = hist[["date", "home_team", "away_team"]]
+    _h = _h[_h["home_team"].isin(_teams) | _h["away_team"].isin(_teams)]
+    combined = pd.concat([_h, _up], ignore_index=True)
     combined_rd = _add_rest_days(combined)
-    tail = combined_rd.tail(len(df)).reset_index(drop=True)
-    df["home_rest_days"] = tail["home_rest_days"].values
-    df["away_rest_days"] = tail["away_rest_days"].values
+    tail = combined_rd.tail(len(df))
+    df["home_rest_days"] = tail["home_rest_days"].to_numpy()
+    df["away_rest_days"] = tail["away_rest_days"].to_numpy()
 
     # Set piece proxies — use league averages from history
     lg_corners = hist.groupby("league").apply(
@@ -799,14 +828,14 @@ def build_upcoming_features(
     lg_fouls = hist.groupby("league").apply(
         lambda g: (g["home_fouls"].mean() + g["away_fouls"].mean())
     )
-    df["combined_corners_pg"] = df["league"].map(lg_corners).fillna(9.5)
-    df["combined_fouls_pg"]   = df["league"].map(lg_fouls).fillna(22.0)
+    # League with no corner/foul history -> NaN, not the invented 9.5 / 22.0 (finding 12).
+    df["combined_corners_pg"] = df["league"].map(lg_corners)
+    df["combined_fouls_pg"]   = df["league"].map(lg_fouls)
     # Per-team rolling SOT ratios (replaces the old hardcoded 0.34 global fallback)
     df["home_sot_ratio_last5"] = df["home_sot_last5"] / df["home_shots_last5"].replace(0, np.nan)
     df["away_sot_ratio_last5"] = df["away_sot_last5"] / df["away_shots_last5"].replace(0, np.nan)
-    df["combined_sot_ratio"] = (
-        df["home_sot_ratio_last5"].fillna(0.35) + df["away_sot_ratio_last5"].fillna(0.33)
-    ) / 2
+    # Same rule as training: NaN when a side has no shot history, never 0.35 / 0.33.
+    df["combined_sot_ratio"] = (df["home_sot_ratio_last5"] + df["away_sot_ratio_last5"]) / 2
 
     # ── Phase 2: Injury features — key_attacker_absent_home / _away ─────────────
     # Pre-fetch per league (one batch per league, not per row) then apply per row.
@@ -842,13 +871,14 @@ def build_upcoming_features(
                     _r["home_team"], _r["away_team"], _r["date"], _ctx
                 ))
             _inj_df = pd.DataFrame(_inj_rows, index=df.index)
-            df["key_attacker_absent_home"] = _inj_df["key_attacker_absent_home"].fillna(0.0)
-            df["key_attacker_absent_away"] = _inj_df["key_attacker_absent_away"].fillna(0.0)
+            # NaN stays NaN (not fetched / fixture unresolved); see injury_features_from_context.
+            df["key_attacker_absent_home"] = _inj_df["key_attacker_absent_home"]
+            df["key_attacker_absent_away"] = _inj_df["key_attacker_absent_away"]
     except Exception as e:
         # Falling back to 0 is safe, but SAY SO. A missing APIFOOTBALL_KEY (which is exactly
         # what happened in predict.yml for months) looks identical to a quiet run when this
         # is a bare `pass`. output/feature_health.json records the resulting degeneracy.
-        log.warning(f"[enrich] injury features unavailable, using defaults: {e}")
+        log.warning(f"[enrich] injury features unavailable, left NaN (not fetched): {e}")
 
     # ── Phase 3: /teams/statistics — real-time season-to-date venue averages ────
     # Overrides _venue_season_stats() values computed from FD historical data.
@@ -995,13 +1025,14 @@ def build_upcoming_features(
         _use = _nf & _best.notna()
         df.loc[_use, "bookmaker_overround"] = _best[_use]
 
-    # Dixon-Coles corrected P(over 2.5)
-    if _dc_p_over25 is not None and "home_scored_last5" in df.columns:
+    # Dixon-Coles corrected P(over 2.5); no form -> NaN (never the market price passed off as ours)
+    if "home_scored_last5" in df.columns:
         _lh = df["home_scored_last5"].clip(lower=0.3, upper=4.0)
         _la = df["away_scored_last5"].clip(lower=0.3, upper=4.0)
-        df["p_over25_poisson_dc"] = [_dc_p_over25(h, a) for h, a in zip(_lh, _la)]
+        df["p_over25_poisson_dc"] = [_dc_p_over25(h, a) if pd.notna(h) and pd.notna(a) else np.nan
+                                     for h, a in zip(_lh, _la)]
     else:
-        df["p_over25_poisson_dc"] = df["implied_prob_over"].fillna(0.5)
+        df["p_over25_poisson_dc"] = np.nan
 
     # ── Optional: API-Football standings metadata (not model features) ────────
     # Adds table position, GD/game, form pts for display in predictions.csv.

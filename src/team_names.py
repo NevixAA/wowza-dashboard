@@ -75,6 +75,15 @@ _ALIASES = {
     "la galaxy": "los angeles galaxy",
     "shandong luneng taishan fc": "shandong taishan",
     "henan fc": "henan songshan longmen",
+    # Data Truth audit 2026-11-01 (finding 6): each club has ONE spelling in its league's history
+    # (checked on fd_history + af_history since 2024), so these only add data - the clubs had no
+    # form at all and every fixture of theirs was AVOID as blind. Clubs whose history holds TWO
+    # spellings (Belgrano, Kyoto, Urawa, UNAM, Celta B) are NOT aliased here: that needs the
+    # duplicate identity unified first (finding 37), or an alias would drop half their history.
+    "saint etienne": "st etienne",
+    "austria wien": "austria vienna",
+    "atletico mineiro": "atletico mg",
+    "argentinos juniors": "argentinos jrs",
 }
 
 
@@ -117,6 +126,11 @@ _RESULT_ALIASES = {
     "qingdao west coast fc": "qingdao youth island",
     "shenzhen peng city fc": "sichuan jiuniu",
     "tianjin jinmen tiger fc": "tianjin teda",
+    # France / Japan (Data Truth audit 2026-11-01, finding 20: never resolved, never graded).
+    # Urawa is spelled both "Urawa" and "Urawa Reds" in the result sources, so the token tiers
+    # refuse it as ambiguous; the alias names the one spelling to use.
+    "saint etienne": "st etienne",
+    "urawa red diamonds": "urawa reds",
 }
 
 

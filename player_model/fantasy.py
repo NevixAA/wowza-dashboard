@@ -30,15 +30,18 @@ from player_model import config
 # scores players, so the pipeline pays for it and the viewer does not.
 
 FANTASY_LEAGUE = "Premier League"
-GOAL_PTS = {"F": 4.0, "M": 5.0, "D": 6.0, "G": 6.0}   # legacy parquet-position goal pts
+GOAL_PTS = {"F": 4.0, "M": 5.0, "D": 6.0, "G": 10.0}  # legacy parquet-position goal pts (GKP 10, FPL)
 # FPL goal points keyed by FPL position codes (GKP/DEF/MID/FWD)
-FPL_GOAL_PTS = {"FWD": 4.0, "MID": 5.0, "DEF": 6.0, "GKP": 6.0}
+# GKP 10, from FPL's own game_config.scoring.goals_scored (was 6 - Data Truth / R2-D fantasy bug #2).
+FPL_GOAL_PTS = {"FWD": 4.0, "MID": 5.0, "DEF": 6.0, "GKP": 10.0}
 # Clean-sheet points by position (DEF/GK 4, MID 1, FWD 0)
 FPL_CS_PTS   = {"DEF": 4.0, "GKP": 4.0, "MID": 1.0, "FWD": 0.0}
-# Defensive-contribution proxy thresholds (actions/game). APPROX: our source gives
-# tackles+interceptions+blocks+duels_won but NOT clearances or ball-recoveries, so these
-# sit below FPL's real 10 (DEF CBIT) / 12 (MID+FWD tackles+recoveries) cut-offs.
-_DC_THRESH = {"DEF": 5.0, "GKP": 999.0, "MID": 4.5, "FWD": 4.0}
+# Defensive-contribution thresholds = FPL's REAL ones, on FPL's OWN action count
+# (elements.defensive_contribution_per_90). Derived 2026-11-01 from FPL's live scoring for GW6-8
+# (2,004 player-gameweeks): DEF scored 2 pts from exactly 10 actions (never at 9), MID from 12
+# (never at 11), FWD never below 12. The old 5 / 4.5 / 4 were applied to our own different count
+# (tackles+interceptions+blocks+duels_won) and gave FWDs more DC pts than DEFs (R2-D fantasy bug #1).
+_DC_THRESH = {"DEF": 10.0, "GKP": 999.0, "MID": 12.0, "FWD": 12.0}
 _POS_ALIAS = {"F": "FWD", "M": "MID", "D": "DEF", "G": "GKP",
               "FWD": "FWD", "MID": "MID", "DEF": "DEF", "GKP": "GKP", "GK": "GKP"}
 _PARQUET = Path(__file__).resolve().parents[1] / "player_history.parquet"
@@ -283,6 +286,7 @@ def build_fantasy_projections(parquet_path: Path | None = None, min_minutes: flo
                 pl.at[i, "fpl_form"]          = rec.get("fpl_form")
                 pl.at[i, "total_points"]      = rec.get("total_points")
                 pl.at[i, "owned_pct"]         = rec.get("owned_pct")
+                pl.at[i, "fpl_dc_per90"]      = rec.get("dc_per90")
         # A player NOT in the current FPL set has LEFT the PL (e.g. Salah -> Besiktas,
         # De Bruyne -> abroad) or isn't fantasy-relevant -> DROP them. The parquet holds many
         # past-season players who've since transferred out, so a LOW match rate is EXPECTED and
@@ -308,18 +312,30 @@ def build_fantasy_projections(parquet_path: Path | None = None, min_minutes: flo
     # only ~0.43 pts beyond goals/assists (they're correlated → +1 double-counted). scripts/fantasy_backtest.py
     pl["attack_pts"] = (pl["p_goal"] * pl["goal_pts"] + pl["p_assist"] * 3.0 + pl["p_sot2"] * 0.45).round(3)
 
-    # Defensive-contribution pts — Poisson P(actions >= threshold) (upgrade from linear clip)
-    thr = pl["position"].map(_DC_THRESH).fillna(6.0)
-    pl["dc_pts"] = [_poisson_dc_pts(float(a or 0), float(t)) for a, t in zip(pl["def_actions_pg"], thr)]
+    # Defensive-contribution pts — Poisson P(actions >= threshold), on FPL's OWN action count per
+    # game (defensive_contribution_per_90 x expected minutes / 90) against FPL's real thresholds.
+    # A player with no FPL figure gets NaN dc_pts (never a guess) and contributes 0 to the total.
+    # def_actions_pg (our proxy count) stays the BONUS input only, where its weights were fitted.
+    thr = pl["position"].map(_DC_THRESH)
+    if "fpl_dc_per90" in pl.columns:
+        _dc_pg = pd.to_numeric(pl["fpl_dc_per90"], errors="coerce") * (m.reindex(pl.index) / 90.0)
+    else:
+        _dc_pg = pd.Series(np.nan, index=pl.index)
+    pl["dc_actions_pg"] = _dc_pg.round(3)
+    pl["dc_pts"] = [_poisson_dc_pts(float(a), float(t)) if (a == a and t == t) else np.nan
+                    for a, t in zip(_dc_pg, thr)]
 
     # Clean-sheet pts — TEAM goals-conceded model blended with fixture difficulty.
     # P(CS) = exp(-lambda); lambda = 0.6·(team recent conceded/game) + 0.4·(FDR-implied opp xG).
     # Falls back to pure FDR when the club isn't matched in the parquet, then to 0.
     conc_map = _team_conceded_map(pl_all)
 
-    def _cs_row(r):
-        fl = fdr_map.get(r["team"], []) if fdr_map else []
-        avg_fdr = np.mean([f["fdr"] for f in fl[:next_n] if f.get("fdr")]) if fl else np.nan
+    def _cs_row(r, fixtures=None):
+        # NEXT fixture only by default: fantasy_pts is a NEXT-GAMEWEEK projection and is settled
+        # against one gameweek, but this averaged the next 5 fixtures' FDR (R2-D fantasy bug
+        # 'v1_next_gw_is_5_fixture_average'). The multi-GW total passes each fixture in turn.
+        fl = fixtures if fixtures is not None else ((fdr_map.get(r["team"], []) if fdr_map else [])[:1])
+        avg_fdr = np.mean([f["fdr"] for f in fl if f.get("fdr")]) if fl else np.nan
         fdr_xg  = (0.5 + 0.42 * avg_fdr) if avg_fdr == avg_fdr else np.nan   # NaN-safe
         tk = _norm_team(r["team"])
         conc = conc_map.get(tk)
@@ -336,22 +352,31 @@ def build_fantasy_projections(parquet_path: Path | None = None, min_minutes: flo
         elif fdr_xg == fdr_xg:
             lam = fdr_xg
         else:
-            return 0.0
-        return round(float(np.exp(-lam)) * FPL_CS_PTS.get(r["position"], 0.0), 3)
+            return np.nan
+        return float(np.exp(-lam))
 
-    pl["cs_pts"] = pl.apply(_cs_row, axis=1)
+    # P(clean sheet) kept as a PROBABILITY: _expected_bonus expects one, and was being handed the
+    # clean-sheet POINTS (0-4) - a DEF/GKP's bonus driver inflated up to 4x (R2-D fantasy bug
+    # 'bonus_cs_points_as_probability'). No CS estimate -> 0 CS points, as before, but the
+    # probability itself stays NaN rather than an invented value.
+    pl["cs_prob"] = pl.apply(_cs_row, axis=1)
+    pl["cs_pts"] = (pl["cs_prob"] * pl["position"].map(FPL_CS_PTS)).fillna(0.0).round(3)
 
     # Expected bonus (from BPS drivers)
     pl["bonus_pts"] = [_expected_bonus(g, a, s, float(d or 0), c) for g, a, s, d, c in
-                       zip(pl["p_goal"], pl["p_assist"], pl["p_sot2"], pl["def_actions_pg"], pl["cs_pts"])]
+                       zip(pl["p_goal"], pl["p_assist"], pl["p_sot2"], pl["def_actions_pg"],
+                           pl["cs_prob"].fillna(0.0))]
 
-    pl["fantasy_pts"] = (pl["appearance"] + pl["attack_pts"] + pl["dc_pts"]
+    pl["fantasy_pts"] = (pl["appearance"] + pl["attack_pts"] + pl["dc_pts"].fillna(0.0)
                          + pl["cs_pts"] + pl["bonus_pts"]).round(3)
 
     # Minutes / rotation risk — P(start) from recent + season start rates, killed by injury
     _sr  = pd.to_numeric(pl.get("starter_rate", np.nan), errors="coerce")
     _ssr = pd.to_numeric(pl.get("season_start_rate", np.nan), errors="coerce")
     pl["p_start"] = (0.6 * _sr.fillna(_ssr) + 0.4 * _ssr.fillna(_sr)).clip(0, 1).fillna(0.6)
+    # float64 explicitly: the start rates arrive as float32, and pandas 3 refuses to upcast on a
+    # masked assignment (TypeError at the doubtful-player line below).
+    pl["p_start"] = pl["p_start"].astype("float64")
     pl.loc[pl["injured"] == True, "p_start"] = 0.0                                    # noqa: E712
     _chance = pd.to_numeric(pl.get("chance_of_playing", np.nan), errors="coerce")
     _dmask = (pl["doubtful"] == True) & _chance.notna()                              # noqa: E712
@@ -421,14 +446,21 @@ def build_fantasy_projections(parquet_path: Path | None = None, min_minutes: flo
         return fdr_map.get(team, [])[:next_n] if fdr_map else []
 
     _atk = pl["attack_pts"].astype(float)
-    _fixed = pl["fantasy_pts"].astype(float) - _atk          # the FDR-neutral remainder
+    _cs_next = pl["cs_pts"].astype(float)
+    # The FDR-neutral remainder: appearance + dc + bonus. Clean-sheet points are fixture-specific
+    # and added per fixture below (they were averaged over 5 fixtures into one figure).
+    _fixed = pl["fantasy_pts"].astype(float) - _atk - _cs_next
+
+    def _cs_pts_for(i, f):
+        p = _cs_row(pl.iloc[i], [f])
+        return 0.0 if p != p else float(p) * FPL_CS_PTS.get(pl["position"].iloc[i], 0.0)
 
     def _per_game(i, team):
-        fl = _fixture_list(team)
+        # NEXT gameweek: the next fixture only (it is settled against one gameweek).
+        fl = _fixture_list(team)[:1]
         if not fl:
             return float(pl["fantasy_pts"].iloc[i])
-        mults = [_fx_mult(f) for f in fl]
-        return float(_fixed.iloc[i] + _atk.iloc[i] * (sum(mults) / len(mults)))
+        return float(_fixed.iloc[i] + _cs_next.iloc[i] + _atk.iloc[i] * _fx_mult(fl[0]))
 
     def _total(i, team):
         fl = _fixture_list(team)
@@ -436,7 +468,7 @@ def build_fantasy_projections(parquet_path: Path | None = None, min_minutes: flo
             # No fixture list: one notional game. A BLANK gameweek legitimately totals 0, but an
             # ABSENT fixture map is missing data — reporting 0 there would look like a blank.
             return float(pl["fantasy_pts"].iloc[i])
-        return float(sum(_fixed.iloc[i] + _atk.iloc[i] * _fx_mult(f) for f in fl))
+        return float(sum(_fixed.iloc[i] + _cs_pts_for(i, f) + _atk.iloc[i] * _fx_mult(f) for f in fl))
 
     _teams = pl["team"].tolist()
     pl["fixture_adj_pts"] = [round(_per_game(i, tm), 3) for i, tm in enumerate(_teams)]
@@ -454,7 +486,8 @@ def build_fantasy_projections(parquet_path: Path | None = None, min_minutes: flo
                             .astype(float) * _pstart).round(2)
 
     keep = [c for c in ["player_name", "team", "position", "price", "minutes_pg",
-                        "p_goal", "p_assist", "p_sot2", "attack_pts", "dc_pts", "cs_pts",
+                        "p_goal", "p_assist", "p_sot2", "attack_pts", "dc_pts", "dc_actions_pg",
+                        "cs_prob", "cs_pts",
                         "bonus_pts", "def_actions_pg", "fantasy_pts", "xpts_rot", "p_start",
                         "is_pen_taker", "value", "availability", "injured",
                         "doubtful", "chance_of_playing", "fpl_matched",
@@ -676,7 +709,7 @@ def upcoming_by_team(next_n: int = 5) -> dict:
     try:
         from player_model.api_football import get_upcoming_fixtures
         lid = config.PROP_LEAGUES.get(FANTASY_LEAGUE, 39)
-        season = config.PROP_SEASONS.get(FANTASY_LEAGUE, "2025")
+        season = config.prop_season(FANTASY_LEAGUE)
         fx = get_upcoming_fixtures(lid, season, next_n=next_n * 12)  # a few GWs to cover all clubs
         out: dict[str, list] = {}
         for f in fx:
@@ -690,12 +723,21 @@ def upcoming_by_team(next_n: int = 5) -> dict:
         return {}
 
 
-def refresh_official_squads(league_id: int | None = None, seasons=("2026", "2025")) -> int:
+def _season_candidates(league: str) -> tuple[str, ...]:
+    """The league's CURRENT API season (registry rules), then the previous one. Replaces the
+    literal ('2026', '2025') - silently last season's squads from mid-2027, and J1 (2027) never
+    right (R2-D fantasy bug 'season_hardcoded')."""
+    cur = config.prop_season(league)
+    return (cur, str(int(cur) - 1)) if str(cur).isdigit() else ()
+
+
+def refresh_official_squads(league_id: int | None = None, seasons=None) -> int:
     """Fetch official current squads via API-Football -> output/pl_squads_official.csv
     (transfer-window accurate; run daily in CI). Picks the first season that has teams.
     Returns player count, or 0 if unavailable (no key / off-season / endpoint)."""
     from player_model.api_football import get_league_teams, get_pl_squads
     lid = league_id or config.PROP_LEAGUES.get(FANTASY_LEAGUE, 39)
+    seasons = seasons or _season_candidates(FANTASY_LEAGUE)
     season = next((s for s in seasons if len(get_league_teams(lid, s)) >= 15), None)
     if not season:
         return 0
@@ -709,7 +751,7 @@ def refresh_official_squads(league_id: int | None = None, seasons=("2026", "2025
 
 
 def refresh_all_squads(leagues: dict | None = None,
-                       seasons=("2026", "2025")) -> int:
+                       seasons=None) -> int:
     """Official current squads for EVERY league we tip in -> output/squads_official.csv.
 
     WHY A SECOND FILE AND NOT A WIDER pl_squads_official.csv. That file is the PREMIER LEAGUE
@@ -748,7 +790,8 @@ def refresh_all_squads(leagues: dict | None = None,
     frames, skipped = [], []
     for name, lid in leagues.items():
         try:
-            season = next((s for s in seasons if len(get_league_teams(lid, s)) >= 8), None)
+            season = next((s for s in (seasons or _season_candidates(name))
+                           if len(get_league_teams(lid, s)) >= 8), None)
             rows = get_pl_squads(lid, season) if season else []
         except Exception as e:                                   # noqa: BLE001
             print(f"[squads] {name} ({lid}) failed: {type(e).__name__}: {e}")
