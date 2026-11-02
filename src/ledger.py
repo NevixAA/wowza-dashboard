@@ -258,11 +258,13 @@ def drop_flipped(bets_df: pd.DataFrame, source: str = "live") -> pd.DataFrame:
 
 def append_tips(bets_df: pd.DataFrame, source: str = "live") -> None:
     """
-    Append new tips into bets_ledger.csv.
-    source="live"     → real prediction tips
-    source="backtest" → walk-forward simulation bets
+    Append new tips into bets_ledger.csv - the PRODUCTION record of real tips only.
+    Simulated backtest bets never enter it (4,115 stale rows from a 2026-05-21 backtest, never
+    settled and partly duplicated, were removed 2026-11-01); backtests write their own files.
     Deduped on (match_date, home, away, side, source).
     """
+    if source != "live":
+        raise ValueError(f"bets_ledger.csv holds live tips only, got source={source!r}")
     if bets_df is None or bets_df.empty:
         return
 
@@ -399,6 +401,10 @@ def _load_side_ledger() -> pd.DataFrame:
     return pd.DataFrame(columns=SIDE_LEDGER_COLS)
 
 
+# pipeline._generate_side_bets is one-sided by construction: BTTS is YES, Over 1.5/3.5 is OVER.
+_SIDE_OF_MARKET = {"btts": "YES", "over15": "OVER", "over35": "OVER"}
+
+
 def append_side_market_tips(side_df: pd.DataFrame, source: str = "live") -> None:
     """Append BTTS / Over 1.5 / Over 3.5 tips to their OWN ledger (side_bets_ledger.csv),
     one row per (fixture, market), ALL tiers. Same rule as append_tips: the FIRST logged tier stands,
@@ -461,6 +467,10 @@ def append_side_market_tips(side_df: pd.DataFrame, source: str = "live") -> None
             "source": source, "generated_at": now, "signal_date": today,
             "match_date": match_date, "league": str(row.get("league", "")),
             "home_team": home, "away_team": away, "market": market,
+            # The producer emits `side` and SIDE_LEDGER_COLS declares it, but it was never written
+            # here, so the column was 100% null (Data Truth audit findings 26, 28).
+            "side": (str(row["side"]) if pd.notna(row.get("side")) and str(row.get("side")).strip()
+                     else _SIDE_OF_MARKET.get(market, "")),
             "odds": odds, "edge_pct": edge_pct, "ev_pct": ev_pct,
             "model_prob": round(float(row.get("model_prob", 0.0) or 0.0), 4),
             "signal_tier": tier,
@@ -616,25 +626,6 @@ def append_ht_tips(preds_df: pd.DataFrame, source: str = "live") -> None:
     updated = pd.concat([existing, pd.DataFrame(new_rows, columns=HT_LEDGER_COLS)], ignore_index=True)
     updated.to_csv(HT_LEDGER_FILE, index=False)
     log.info(f"HT ledger: {len(new_rows)} new tip(s) → {HT_LEDGER_FILE}")
-
-
-def append_backtest_results(backtest_df: pd.DataFrame, model_type: str = "") -> None:
-    """
-    Append walk-forward backtest bets into the ledger with source="backtest".
-    Only OVER/UNDER bets are appended (AVOID rows are skipped).
-    """
-    bets = backtest_df[backtest_df["bet"].isin(["OVER", "UNDER"])].copy()
-    if bets.empty:
-        return
-
-    # Map backtest columns → append_tips compatible format
-    bets = bets.rename(columns={"bet": "bet", "best_edge": "best_edge"})
-    if "best_edge" not in bets.columns and "edge_over" in bets.columns:
-        bets["best_edge"] = bets[["edge_over", "edge_under"]].max(axis=1)
-    if "model_type" not in bets.columns:
-        bets["model_type"] = model_type
-
-    append_tips(bets, source="backtest")
 
 
 def print_ledger() -> None:

@@ -211,7 +211,7 @@ def send_fantasy_tips(max_per_pos: int = 3) -> int:
         from player_model import config as _pc
         fx = get_upcoming_fixtures(
             _pc.PROP_LEAGUES["Premier League"],
-            _pc.PROP_SEASONS.get("Premier League", "2025"), next_n=1)
+            _pc.prop_season("Premier League"), next_n=1)
         if not fx:
             print("[fantasy] no upcoming PL fixtures — skipping (off-season)")
             return 0
@@ -602,9 +602,11 @@ def notify_wc_strong() -> int:
     strong = strong[strong["_date"].between(today, cutoff)]
 
     # Priority: STRONG first, then SHARP, then FADING; within each by absolute drift
-    _sig_order = {"STRONG": 0, "SHARP": 1, "FADING": 2}
-    strong["_sig_rank"] = strong["signal"].map(_sig_order).fillna(9)
-    strong = strong.sort_values(["_sig_rank", "drift_pct"], key=lambda s: s if s.name != "drift_pct" else s.abs(), ascending=[True, False])
+    # STEAM_STRONG / STEAM_SHARP rank with STRONG / SHARP (they used to fall to a sentinel 9, last)
+    _sig_order = {"STRONG": 0, "STEAM_STRONG": 0, "SHARP": 1, "STEAM_SHARP": 1, "FADING": 2}
+    strong["_sig_rank"] = strong["signal"].astype(str).str.upper().map(_sig_order)
+    strong = strong.sort_values(["_sig_rank", "drift_pct"], key=lambda s: s if s.name != "drift_pct" else s.abs(),
+                                ascending=[True, False], na_position="last")
 
     if strong.empty:
         return 0
@@ -2676,7 +2678,7 @@ def notify_side_bets() -> int:
             f"🏆 {row.get('league', '')}\n"
             f"⚽ {row['home_team']} vs {row['away_team']}\n"
             f"📌 <b>{label}</b>  @ {float(row['market_odds']):.2f}\n"
-            f"📊 Edge: <b>{edge:.1f}%</b>  |  EV: <b>{ev:+.1f}%</b>  |  P={float(row['model_prob'])*100:.0f}%\n"
+            f"📊 Edge: <b>{edge:.1f}%</b>  |  EV: <b>{ev:+.1f}%</b>  |  Model P={float(row['model_prob'])*100:.0f}%\n"
             f"⚠️ Check your bookmaker's {label} market"
         )
 

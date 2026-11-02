@@ -96,6 +96,7 @@ def _fetch_odds_api(days_ahead: int = 7) -> pd.DataFrame:
 
     rows = []
     n_queried = n_ok = n_err = 0   # health telemetry (see _LAST_FETCH_STATS)
+    _failed_leagues: list[str] = []
     # Per-book prices already present in the OddsAPI response. Collected here and written to
     # output/book_odds_snapshots.csv below; see the note at the capture site.
     _book_rows: list[dict] = []
@@ -121,7 +122,10 @@ def _fetch_odds_api(days_ahead: int = 7) -> pd.DataFrame:
             )
             if r.status_code != 200:
                 n_err += 1
-                log.debug(f"OddsAPI {league}: HTTP {r.status_code}")
+                # WARNING and named: at DEBUG a single league could drop off the board with no
+                # record of which one (Data Truth audit finding 14).
+                _failed_leagues.append(f"{league}: HTTP {r.status_code}")
+                log.warning(f"OddsAPI {league}: HTTP {r.status_code} — league skipped this run")
                 continue
             n_ok += 1
 
@@ -234,7 +238,8 @@ def _fetch_odds_api(days_ahead: int = 7) -> pd.DataFrame:
                     })
         except Exception as e:
             n_err += 1
-            log.debug(f"OddsAPI {league} exception: {e}")
+            _failed_leagues.append(f"{league}: {type(e).__name__}")
+            log.warning(f"OddsAPI {league} exception: {e} — league skipped this run")
 
     # ── BTTS: per-event, whole board ─────────────────────────────────────────────────
     # BTTS is unavailable on the bulk /odds endpoint (asking for it 422s the ENTIRE call, which is
@@ -249,7 +254,8 @@ def _fetch_odds_api(days_ahead: int = 7) -> pd.DataFrame:
     # Health telemetry: distinguishes "every league errored" (hard failure — the
     # btts-422 signature) from "leagues OK but no games". Read by the notifier.
     global _LAST_FETCH_STATS, _LAST_BOOK_ROWS
-    _LAST_FETCH_STATS = {"queried": n_queried, "ok": n_ok, "err": n_err, "kept": len(rows)}
+    _LAST_FETCH_STATS = {"queried": n_queried, "ok": n_ok, "err": n_err, "kept": len(rows),
+                         "failed_leagues": _failed_leagues}
     _LAST_BOOK_ROWS = list(_book_rows)          # shadow-only copy; see the module-level note
 
     # Persist the per-book prices. Wrapped so it can NEVER affect predict: a timed-out or
@@ -443,6 +449,21 @@ def predict_upcoming(
     feat.loc[std_mask, "model_type"] = "standard"
     feat.loc[nf_mask,  "model_type"] = "new_format"
 
+    # NEW-FORMAT RECALIBRATION TO OUTCOMES (owner 2026-11-01, src/nf_calibration.py): NF overs were
+    # under-rated ~10pp against results. A one-parameter shift fitted on settled fixtures predicted
+    # by the FIXED pipeline; applied only once n >= 150 and its CI excludes zero, reported always.
+    # p_over25_raw keeps the model's own number.
+    feat["p_over25_raw"] = feat["p_over25"]
+    try:
+        from src import nf_calibration as _nfc
+        _cal = _nfc.fit()
+        if nf_mask.any():
+            feat.loc[nf_mask, "p_over25"] = _nfc.apply(feat.loc[nf_mask, "p_over25"].astype(float), _cal)
+        log.info(f"  NF calibration: n={_cal['n']} shift={_cal.get('shift')} ci={_cal.get('ci95')} "
+                 f"-> {_cal.get('reason')}")
+    except Exception as _e:                                            # noqa: BLE001
+        log.warning(f"  NF calibration skipped ({type(_e).__name__}: {_e}) - raw probabilities served")
+
     # How much of each model's input actually arrived? Blank/constant features are imputed
     # silently and skew the calibrated logistic member — the new-format bug in one line.
     # Diagnostic only; never alters a prediction.
@@ -491,14 +512,22 @@ def predict_upcoming(
             # attach_ht_features rebuilds the accumulators over `historical` and emits the
             # upcoming rows only. Upcoming fixtures carry no half-time score, so they receive
             # features and update nothing — every one sees the full history, none sees another.
-            _ht_scored = feat
+            _ht_ok = False          # score HT only on features attached to the right fixtures
             try:
                 from src.ht_features import attach_ht_features, HT_FEATURE_COLS
                 _ht = attach_ht_features(historical, feat)
-                if len(_ht) == len(feat):
+                # Same fixture on every row, or nothing: a positional copy with a mere length
+                # check is how every HT feature landed on the wrong fixture until 2026-11-01.
+                _aligned = len(_ht) == len(feat) and all(
+                    (_ht[k].astype(str).to_numpy() == feat[k].astype(str).to_numpy()).all()
+                    for k in ("home_team", "away_team"))
+                if not _aligned:
+                    log.error("  HT features do not line up with the fixtures — HT not scored this run")
+                elif len(_ht) == len(feat):
                     for _c in HT_FEATURE_COLS:
                         if _c in _ht.columns:
                             feat[_c] = _ht[_c].to_numpy()
+                    _ht_ok = True
                     _cov = float(np.mean([feat[c].notna().mean() for c in HT_FEATURE_COLS
                                           if c in feat.columns]))
                     log.info(f"  HT features attached: {_cov:.0%} populated")
@@ -509,12 +538,15 @@ def predict_upcoming(
                 else:
                     log.warning(f"  HT feature rows {len(_ht)} != fixtures {len(feat)} — skipped")
             except Exception as _e:                                   # noqa: BLE001
-                log.warning(f"  HT feature attach failed ({_e}) — model may be degraded")
+                log.error(f"  HT feature attach failed ({_e}) — HT not scored this run")
 
-            feat.loc[std_mask, "p_ht_over05"] = predict_proba(feat[std_mask], payload=ht_payload_05).values
-            if ht_payload_15:
-                feat.loc[std_mask, "p_ht_over15"] = predict_proba(feat[std_mask], payload=ht_payload_15).values
-            log.info(f"  HT model: {std_mask.sum()} fixtures scored")
+            # FAIL CLOSED: scoring on missing features imputes them (z ~ -37, see above) and emits
+            # confident nonsense. No HT features, no HT probabilities.
+            if _ht_ok:
+                feat.loc[std_mask, "p_ht_over05"] = predict_proba(feat[std_mask], payload=ht_payload_05).values
+                if ht_payload_15:
+                    feat.loc[std_mask, "p_ht_over15"] = predict_proba(feat[std_mask], payload=ht_payload_15).values
+                log.info(f"  HT model: {std_mask.sum()} fixtures scored")
         except Exception as e:
             log.warning(f"  HT model prediction failed: {e}")
 

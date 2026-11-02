@@ -51,24 +51,25 @@ SIDE_LEDGER_FILE   = config.OUTPUT_DIR / "side_bets_ledger.csv"
 # ── Team name normalisation ───────────────────────────────────────────────────
 
 def _norm(name: str) -> str:
-    """Lowercase + strip accents for fuzzy matching."""
+    """Lowercase + strip accents + collapse whitespace for fuzzy matching."""
     nfkd = unicodedata.normalize("NFKD", str(name))
     ascii_str = "".join(c for c in nfkd if not unicodedata.combining(c))
-    return ascii_str.lower().strip()
+    return " ".join(ascii_str.lower().split())
 
 
 def _names_match(a: str, b: str) -> bool:
-    """True if two team names refer to the same club (normalised exact or substring)."""
-    na, nb = _norm(a), _norm(b)
-    if na == nb:
-        return True
-    # substring both ways (handles "Man City" vs "Manchester City" style)
-    if na in nb or nb in na:
-        return True
-    # first-word match for short names
-    if na.split()[0] == nb.split()[0] and len(na.split()[0]) >= 4:
-        return True
-    return False
+    """True if two team names refer to the same club, by the canonical resolver
+    (src.team_names.resolve_result: normalised equality, aliases incl. result spellings, then
+    identity tokens that must pair up, reserve sides only with reserve sides).
+
+    This was substring-or-first-word, which called Real Madrid = Real Sociedad, Man City = Man
+    United, Bristol City = Bristol Rovers and Sheffield United = Sheffield Wednesday, while missing
+    LA Galaxy / Los Angeles Galaxy, Bodø/Glimt / Bodo/Glimt and Bragantino-SP / RB Bragantino, so
+    8 live tips sat unsettled and 64 had no closing price (Data Truth audit findings 17, 18)."""
+    from src.team_names import resolve_result
+    if not a or not b:
+        return False
+    return resolve_result(str(a), [str(b)]) is not None or resolve_result(str(b), [str(a)]) is not None
 
 
 # ── football-data.co.uk scores fetch ─────────────────────────────────────────
@@ -96,7 +97,18 @@ _FD_SOURCES = {
 }
 
 _FD_NEW_URL = "https://www.football-data.co.uk/new/{code}.csv"
-_FD_STD_URL = "https://www.football-data.co.uk/mmz4281/2526/{code}.csv"
+_FD_STD_URL = "https://www.football-data.co.uk/mmz4281/{season}/{code}.csv"
+
+
+def _fd_std_season_codes(today=None) -> list[str]:
+    """football-data season folders for the CURRENT and PREVIOUS split season ('2627', '2526').
+    This was the literal '2526', so from August 2026 no 2026/27 fixture in these leagues could
+    ever settle here (Data Truth audit findings 15, 29). Previous season too: a tip from May still
+    needs grading in August."""
+    d = pd.Timestamp(today or datetime.utcnow().date())
+    start = d.year if d.month >= 7 else d.year - 1
+    return [f"{y % 100:02d}{(y + 1) % 100:02d}" for y in (start, start - 1)]
+
 
 def fetch_scores_fd(league: str) -> list[dict]:
     """Fetch completed results from football-data.co.uk (free, no quota). Includes HT scores where available."""
@@ -108,17 +120,25 @@ def fetch_scores_fd(league: str) -> list[dict]:
     try:
         from io import StringIO
 
-        url = _FD_NEW_URL.format(code=code) if fmt == "new" else _FD_STD_URL.format(code=code)
-        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code != 200:
-            log.debug(f"  FD {league}: HTTP {r.status_code}")
+        urls = ([_FD_NEW_URL.format(code=code)] if fmt == "new" else
+                [_FD_STD_URL.format(season=s, code=code) for s in _fd_std_season_codes()])
+        parts = []
+        for url in urls:
+            r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code != 200:
+                log.warning(f"  FD {league}: HTTP {r.status_code} for {url}")
+                continue
+            parts.append(pd.read_csv(StringIO(r.text), encoding="utf-8-sig",
+                                     on_bad_lines="skip", low_memory=False))
+        if not parts:
             return []
-
-        raw = pd.read_csv(StringIO(r.text), encoding="utf-8-sig",
-                          on_bad_lines="skip", low_memory=False)
+        raw = pd.concat(parts, ignore_index=True)
 
         if fmt == "new" and "Season" in raw.columns:
-            raw = raw[raw["Season"].astype(str).str.contains("2025|2026")].copy()
+            # This year and last year, never a literal list: '2025|2026' dropped every NF result
+            # from the 2027 calendar seasons on (Data Truth audit finding 21).
+            _y = datetime.utcnow().year
+            raw = raw[raw["Season"].astype(str).str.contains(f"{_y - 1}|{_y}")].copy()
 
         results = []
         for _, row in raw.iterrows():
@@ -343,7 +363,7 @@ def _closing_odds_json(home: str, away: str, match_date: str, side: str) -> floa
 _AF_RESULTS_CACHE: dict = {}
 
 
-def fetch_scores_apifootball(league: str) -> list[dict]:
+def fetch_scores_apifootball(league: str, match_date: str | None = None) -> list[dict]:
     """Completed fixtures for a league from API-Football, in fetch_scores() shape.
 
     WHY THIS EXISTS: leagues without a football-data source (Argentina, Brazil, Finland,
@@ -360,14 +380,16 @@ def fetch_scores_apifootball(league: str) -> list[dict]:
     where everything settles normally makes no extra API calls at all. That matters: this
     job runs every 2 hours and has no actions/cache step.
     """
-    if league in _AF_RESULTS_CACHE:
-        return _AF_RESULTS_CACHE[league]
-
     out: list[dict] = []
     lid = config.API_FOOTBALL_IDS.get(league)
     # League-aware season (R2 finding 6): was API_FOOTBALL_SEASONS.get(league, API_SEASON="2025").
+    # The MATCH's season, not today's: a tip from the previous campaign was looked up in the
+    # current one and could never settle - 52 live O/U 2.5 tips from May-Oct 2026 were stranded
+    # (Data Truth audit findings 22, 30). Cached per (league, season).
     from src.season_resolver import resolve_api_season, is_known, record_degradation
-    season = resolve_api_season(league) if lid else None
+    season = resolve_api_season(league, match_date) if lid else None
+    if (league, season) in _AF_RESULTS_CACHE:
+        return _AF_RESULTS_CACHE[(league, season)]
     if lid and not is_known(season):
         record_degradation("update_results._af_completed", league)
         log.warning(f"  [api-football] {league}: season unresolvable - fallback settlement skipped")
@@ -399,7 +421,7 @@ def fetch_scores_apifootball(league: str) -> list[dict]:
     else:
         log.debug(f"  [api-football] {league}: no API_FOOTBALL_IDS entry")
 
-    _AF_RESULTS_CACHE[league] = out
+    _AF_RESULTS_CACHE[(league, season)] = out
     return out
 
 
@@ -453,17 +475,35 @@ def _find_result(
 
 # ── Player prop result resolver ───────────────────────────────────────────────
 
+def _initial_surname_match(name_key: str, stats_map: dict):
+    """'armand laurienté' <-> 'a. laurienté': same first initial AND same last word, exactly one
+    candidate in this fixture's stats, else None (never a guess between two players)."""
+    import re as _re
+    toks = _re.sub(r"[^a-z0-9 ]", " ", name_key).split()
+    if len(toks) < 2:
+        return None
+    hits = []
+    for k, v in stats_map.items():
+        kt = _re.sub(r"[^a-z0-9 ]", " ", k).split()
+        if len(kt) >= 2 and kt[-1] == toks[-1] and kt[0][0] == toks[0][0]:
+            hits.append(v)
+    return hits[0] if len(hits) == 1 else None
+
+
+_PLAYER_MARKET_STAT = {"goals": "goals", "sot": "shots_on_target", "cards": "yellow_card",
+                       "assists": "assists"}
+
+
 def _resolve_player_market(market: str, stats: dict) -> str:
-    """Determine WIN/LOSS for a player prop market given their fixture stats."""
-    if market == "goals":
-        return "WIN" if int(stats.get("goals", 0)) >= 1 else "LOSS"
-    if market == "sot":
-        return "WIN" if int(stats.get("shots_on_target", 0)) >= 1 else "LOSS"
-    if market == "cards":
-        return "WIN" if int(stats.get("yellow_card", 0)) >= 1 else "LOSS"
-    if market == "assists":
-        return "WIN" if int(stats.get("assists", 0)) >= 1 else "LOSS"
-    return ""
+    """WIN/LOSS for a player prop: `<base>` means 1+, `<base><N>` means N+ ('sot2' = 2+ shots on
+    target). The producer writes sot2/sot3/goals2; this used to know only the bare names, so every
+    multi-threshold prop stayed pending for ever (Data Truth audit finding 19). Unknown -> ''."""
+    import re
+    m = re.fullmatch(r"([a-z]+?)(\d*)", str(market or "").strip().lower())
+    if not m or m.group(1) not in _PLAYER_MARKET_STAT:
+        return ""
+    need = int(m.group(2) or 1)
+    return "WIN" if int(stats.get(_PLAYER_MARKET_STAT[m.group(1)], 0) or 0) >= need else "LOSS"
 
 
 def _fetch_fixture_player_stats(league_id: int, season: str, date_str: str, home: str, away: str) -> dict[str, dict]:
@@ -547,13 +587,15 @@ def update_player_results(days: int = 3, dry_run: bool = False) -> None:
             log.debug(f"  {league}: no PROP_LEAGUES entry — skipping")
             continue
 
-        yr     = int(date_str[:4])
-        # Single-year tournaments (WC=1, Euros=4, Copa America=9) use the match year directly.
-        # Club leagues that span two calendar years use yr-1 for Jan-Jun matches.
-        _SINGLE_YEAR_LEAGUES = {1, 4, 9}
-        season = str(yr) if league_id in _SINGLE_YEAR_LEAGUES else (
-            str(yr - 1) if int(date_str[5:7]) < 7 else str(yr)
-        )
+        # The fixture's OWN season from the canonical resolver (config/leagues.json season rules).
+        # The hand rule here ("Jan-Jun means yr-1") is European-only: calendar-year leagues (MLS,
+        # Brazil, Nordics, China, Ireland) were looked up a year behind every spring, and J1 (season
+        # 2027 since 2026-07) never settled (Data Truth audit findings 23, 25).
+        from src.season_resolver import resolve_api_season, is_known
+        season = resolve_api_season(league, date_str)
+        if not is_known(season):
+            log.warning(f"  {league}: no season for {date_str} in the registry — leaving pending")
+            continue
 
         # ── Step 1: look up fixture as FT (completed) ─────────────────────────
         if cache_key not in fixture_cache:
@@ -582,15 +624,40 @@ def update_player_results(days: int = 3, dry_run: bool = False) -> None:
 
         stats_map = stats_cache[cache_key]
 
+        # NO STATS FOR THE WHOLE FIXTURE IS NOT "DID NOT PLAY". An API error, an empty body or stats
+        # not yet published all look like this, and until 2026-11-01 every prop on such a fixture
+        # was voided as DNP for good (Data Truth audit finding 16). Leave it pending and retry; only
+        # after 7 days is it voided, and then with a note that says why.
+        if not stats_map:
+            _age = (pd.Timestamp(today_str) - pd.Timestamp(date_str)).days if date_str else 0
+            if _age >= 7:
+                log.warning(f"  {home} vs {away} ({date_str}): no player stats after {_age} days — VOID (NO_STATS)")
+                updates.append({"idx": idx, "is_played": "True", "result": "VOID",
+                                "pnl": "0.0", "notes": "NO_STATS_7D", "resolved_date": today_str})
+            else:
+                log.info(f"  {home} vs {away} ({date_str}): no player stats yet — leaving pending")
+            continue
+
         # ── Step 3: find this player in the stats ─────────────────────────────
+        # BY PLAYER ID FIRST (the ledger carries API-Football's id). Name-only matching voided as
+        # "DNP" props on players who played 90 minutes: the ledger says 'Armand Laurienté', the
+        # stats say 'A. Laurienté', and the first-5-letters fallback ('arman' vs 'a. la') missed -
+        # 31 of 63 tipped voids in Oct 2026 (player_history shows them playing). Then the exact
+        # name, then same first initial + same surname with exactly ONE candidate. The old
+        # first-5-letters guess is gone: it could also hand a player another player's stats.
+        stats = None
+        _pid = row.get("player_id")
+        try:
+            _pid = str(int(float(_pid))) if _pid not in (None, "") and str(_pid) != "nan" else None
+        except (TypeError, ValueError):
+            _pid = None
+        if _pid:
+            stats = next((v for v in stats_map.values() if str(v.get("player_id")) == _pid), None)
         player_key = _norm(player)
-        stats = stats_map.get(player_key)
         if stats is None:
-            # Fuzzy fallback: first-5-chars match
-            for k, v in stats_map.items():
-                if len(player_key) >= 5 and len(k) >= 5 and (player_key[:5] in k or k[:5] in player_key):
-                    stats = v
-                    break
+            stats = stats_map.get(player_key)
+        if stats is None:
+            stats = _initial_surname_match(player_key, stats_map)
 
         if stats is None:
             # Player not in fixture stats at all — did not play (DNP)
@@ -772,11 +839,17 @@ def update_sharp_results(days: int = 3, dry_run: bool = False) -> None:
             log.debug(f"  sharp: {home} vs {away} {date_str} not found in scores")
             continue
 
+        # No usable entry price -> the RESULT is graded, the P/L is not. This defaulted to odds 1.0,
+        # so a WIN was booked at 0.0 with no flag (Data Truth audit finding 27).
         try:
             opening_odds = float(row["opening_odds"])
         except (TypeError, ValueError):
-            opening_odds = 1.0
-        pnl = round(opening_odds - 1.0, 4) if match_result == "WIN" else -1.0
+            opening_odds = np.nan
+        if not opening_odds > 1.0:
+            pnl = np.nan
+            log.warning(f"  sharp: {home} vs {away} {date_str} has no entry price — result kept, P/L left empty")
+        else:
+            pnl = round(opening_odds - 1.0, 4) if match_result == "WIN" else -1.0
 
         updates.append({"idx": idx, "result": match_result, "pnl": pnl})
         log.info(
@@ -882,18 +955,24 @@ def update_side_market_results(days: int = 3, dry_run: bool = False) -> None:
         # fixture the primary source missed (football-data lag or spelling, OddsAPI's 3-day window)
         # stayed pending forever while the O/U tip on the same match settled: 38 BTTS/O1.5/O3.5
         # rows since 2026-10-10 (found 2026-10-25). Lazy, so a healthy run costs no calls.
-        ev_found = _match(scores_cache.get(league, [])) or _match(fetch_scores_apifootball(league))
+        ev_found = _match(scores_cache.get(league, [])) or _match(fetch_scores_apifootball(league, date_str))
         if ev_found is None:
             continue
 
         res = _resolve_side_market(market, ev_found["home_score"], ev_found["away_score"])
         if not res:
             continue
+        # No usable entry price -> result graded, P/L left empty (was odds 1.0: a WIN booked at 0.0
+        # with no flag, Data Truth audit finding 27).
         try:
             odds = float(row["odds"])
         except (TypeError, ValueError):
-            odds = 1.0
-        pnl = round(odds - 1.0, 4) if res == "WIN" else -1.0
+            odds = np.nan
+        if not odds > 1.0:
+            pnl = np.nan
+            log.warning(f"  side {market}: {home} vs {away} {date_str} has no entry price — P/L left empty")
+        else:
+            pnl = round(odds - 1.0, 4) if res == "WIN" else -1.0
 
         # Closing line -> CLV, same percent convention as bets_ledger/ht_ledger.
         # A missing closing price is normal (thin 2nd-div side markets); grade the result
@@ -1094,16 +1173,25 @@ def update_ht_results(days: int = 3) -> None:
     def _ht_score(league: str, home: str, away: str, day: str):
         """HT goals for one fixture, or None. League-scoped so a name can't cross competitions."""
         g = _by_day.get((day, str(league)))
-        if g is None or g.empty:
+        if g is not None and not g.empty:
+            h = _resolve_team(home, list(g["home_team"]))
+            a = _resolve_team(away, list(g["away_team"]))
+            if h and a:
+                m = g[(g["home_team"] == h) & (g["away_team"] == a)]
+                # Exactly one, or nothing. An ambiguous match is not graded — a wrong settlement
+                # is far worse than a late one.
+                if len(m) == 1:
+                    return (m.iloc[0]["hh"], m.iloc[0]["ha"])
+        # LAST RESORT: API-Football's completed fixtures for THIS match's season carry HT scores.
+        # Without it a fixture missing from both committed stores stayed pending for ever
+        # (Data Truth audit finding 24). Same rules: resolved names, exactly one match.
+        from src.team_names import resolve_result as _rr
+        evs = [e for e in fetch_scores_apifootball(str(league), day)
+               if e.get("date_str") == day and "ht_home" in e]
+        if not evs:
             return None
-        h = _resolve_team(home, list(g["home_team"]))
-        a = _resolve_team(away, list(g["away_team"]))
-        if not h or not a:
-            return None
-        m = g[(g["home_team"] == h) & (g["away_team"] == a)]
-        # Exactly one, or nothing. An ambiguous match is not graded — a wrong settlement is far
-        # worse than a late one.
-        return (m.iloc[0]["hh"], m.iloc[0]["ha"]) if len(m) == 1 else None
+        hits = [e for e in evs if _rr(home, [e["home_team"]]) and _rr(away, [e["away_team"]])]
+        return (hits[0]["ht_home"], hits[0]["ht_away"]) if len(hits) == 1 else None
 
     # ── THE ODDS JOIN NEEDS THE SAME NAME RESOLUTION, for the same reason ───────────────
     # The captured prices are real and plentiful — 4,478 ht_* rows, all four lines, 250 on a
@@ -1160,10 +1248,12 @@ def update_ht_results(days: int = 3) -> None:
         try:
             fair = float(led.at[i, "fair_odds"])
         except (TypeError, ValueError):
-            fair = 1.0
-        stake_odds = entry or close or fair or 1.0   # settle at ENTRY (open), like main/side ledgers
+            fair = None
+        stake_odds = entry or close or fair          # settle at ENTRY (open), like main/side ledgers
         led.at[i, "result"] = res
-        led.at[i, "pnl"] = round(stake_odds - 1.0, 3) if res == "WIN" else -1.0
+        # No price at all -> no P/L. The final `or 1.0` booked a WIN at 0.0 (finding 27).
+        led.at[i, "pnl"] = (np.nan if not (stake_odds and stake_odds > 1.0)
+                            else round(stake_odds - 1.0, 3) if res == "WIN" else -1.0)
         # MARK THE CIRCULAR ONES. With no captured price this settles at the model's OWN fair
         # odds (1/p), so a win returns exactly what the model implied and the P/L measures
         # nothing about the market — it only restates the model's confidence. Summing those
@@ -1645,7 +1735,7 @@ def main():
                 away=row["away_team"],
                 date_str=row["match_date"],
                 side=row["side"],
-                completed=fetch_scores_apifootball(league),
+                completed=fetch_scores_apifootball(league, str(row["match_date"])[:10]),
             )
 
         if found is None:

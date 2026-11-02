@@ -231,6 +231,7 @@ V91_SHADOW_ROW = Schema(
         Col("kickoff_utc", "datetime"), Col("league", nullable=False),
         Col("model_type", allowed=TRACKS + ("unknown",)),
         P("p_v9"), P("p_v91"), P("p_pro_hgb"), P("p_goal_distribution"), P("p_market"),
+        P("p_v9_served"),
         Col("v9_side", allowed=("OVER", "UNDER")), Col("v9_tier", allowed=LEGACY_TIERS),
         Col("v9_edge", "float", min=-1.0, max=1.0), ODDS("entry_odds"), ODDS("closing_odds"),
         Col("clv", "float"), Col("result", allowed=RESULTS),
@@ -439,7 +440,7 @@ SETTLEMENT_ROW = Schema(
     "valid with blank result and pnl.",
     kind="settlement", writers=("output/bets_ledger.csv", "output/side_bets_ledger.csv"),
     columns=(
-        Col("source", allowed=("live", "backtest")), Col("match_date", "date", nullable=False),
+        Col("source", allowed=("live",)), Col("match_date", "date", nullable=False),
         Col("league", nullable=False), Col("home_team", nullable=False), Col("away_team", nullable=False),
         ODDS("odds"), Col("signal_tier", allowed=TIERS), Col("model_type", allowed=TRACKS + ("unknown",)),
         Col("result", allowed=RESULTS), Col("pnl", "float"), ODDS("closing_odds"), Col("clv_pct", "float"),
