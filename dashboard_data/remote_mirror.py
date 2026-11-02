@@ -342,9 +342,57 @@ def _paths(entries) -> set[str]:
     return {(e["path"] if isinstance(e, dict) else str(e)) for e in (entries or [])}
 
 
+# CODE DRIFT IS DECIDED BY CONTENT, NOT SIZE (Data Truth round 2, 2026-11-02). This used to compare
+# (path, bytes): an edit that keeps the byte count passed as COMPATIBLE, and a file that differs
+# only in line endings (CRLF from a Windows checkout) showed as drift. The manifest entry now carries
+# `sha256_lf` - sha256 of the content with CRLF / CR normalised to LF - and drift is a hash mismatch.
+# A manifest WITHOUT hashes cannot prove anything, so the verdict is UNKNOWN, never COMPATIBLE.
+HASH_KEY = "sha256_lf"
+
+
+def content_sha(data: bytes) -> str:
+    """sha256 of `data` with line endings normalised to LF."""
+    import hashlib
+    return hashlib.sha256(data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")).hexdigest()
+
+
+def file_entry(root: Path, rel: str) -> dict:
+    """The manifest entry for one code file: path, bytes (informational) and sha256_lf. For v9's
+    scripts/dashboard_manifest.py, which generates both manifests compared here."""
+    b = (Path(root) / rel).read_bytes()
+    return {"path": rel, "bytes": len(b), HASH_KEY: content_sha(b)}
+
+
+def _hashed(entries) -> bool:
+    es = [e for e in (entries or [])]
+    return bool(es) and all(isinstance(e, dict) and e.get(HASH_KEY) for e in es)
+
+
 def _code_sig(entries) -> set[tuple]:
+    return {((e.get("path"), e.get(HASH_KEY)) if isinstance(e, dict) else (str(e), None))
+            for e in (entries or [])}
+
+
+def _bytes_sig(entries) -> set[tuple]:
     return {((e.get("path"), e.get("bytes")) if isinstance(e, dict) else (str(e), None))
             for e in (entries or [])}
+
+
+def deployed_drift(entries, root: Path | None = None) -> list[str]:
+    """Code files on disk whose LF-normalised content differs from the build manifest's hash
+    (a hand edit or a partial deploy). Missing files count as drift."""
+    root = ROOT if root is None else root
+    out = []
+    for e in entries or []:
+        if not isinstance(e, dict) or not e.get(HASH_KEY):
+            continue
+        p = Path(root) / e["path"]
+        try:
+            if content_sha(p.read_bytes()) != e[HASH_KEY]:
+                out.append(e["path"])
+        except OSError:
+            out.append(e["path"])
+    return sorted(out)
 
 
 HEALTHY = ("COMPATIBLE", "LOCAL_CHECKOUT")
@@ -393,7 +441,21 @@ def compatibility() -> dict:
                     "misread the data. Rebuild and push the slim repo from current v9.")
     data_new = sorted(_paths(v.get("data")) - _paths(own.get("data")))
     data_gone = sorted(_paths(own.get("data")) - _paths(v.get("data")))
+    if not (_hashed(v.get("code")) and _hashed(own.get("code"))):
+        size_only = sorted({p for p, _ in (_bytes_sig(v.get("code")) ^ _bytes_sig(own.get("code")))})
+        return done("UNKNOWN", "The dashboard manifests carry no content hashes (sha256_lf), so "
+                    "code drift cannot be decided: equal sizes do not prove equal code and a "
+                    "line-ending change alters the size. Regenerate the manifest with hashes.",
+                    drift_basis="none (sizes only)", code_files_size_differs=size_only[:20],
+                    data_files_new=data_new[:20], data_files_dropped=data_gone[:20])
+    rec["drift_basis"] = HASH_KEY
     code_diff = sorted({p for p, _ in (_code_sig(v.get("code")) ^ _code_sig(own.get("code")))})
+    on_disk = deployed_drift(own.get("code"))
+    if on_disk:
+        return done("STALE_BUILD", f"{len(on_disk)} deployed code file(s) differ from this build's "
+                    "own manifest (hand edit or partial deploy). Rebuild and push the slim repo.",
+                    deployed_files_modified=on_disk[:20], code_files_differ=code_diff[:20],
+                    data_files_new=data_new[:20], data_files_dropped=data_gone[:20])
     if data_new or data_gone or code_diff:
         return done("STALE_BUILD", f"The deployed dashboard code is older than v9's dashboard at the "
                     f"mirrored SHA ({len(code_diff)} code file(s) differ, {len(data_new)} data file(s) "
