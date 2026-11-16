@@ -224,6 +224,15 @@ def _norm_club(s: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+#: Internal column (load_all_matches -> _canonicalise_clubs only): which source a merged row came
+#: from, as a rank. Higher wins a completeness tie. football-data is the primary record, a fresh
+#: download supersedes the committed cache, API-Football covers leagues football-data lacks, and the
+#: backtest archive is v9's own DERIVED backtest output, so it never beats a primary copy on a tie.
+SOURCE_PRIORITY_COL = "_source_priority"
+SOURCE_PRIORITY = {"football_data_download": 3, "football_data_cache": 2, "api_football": 1,
+                   "backtest_archive": 0}
+
+
 def _canonicalise_clubs(df: pd.DataFrame) -> pd.DataFrame:
     """One spelling per club per league, then a real de-duplication.
 
@@ -302,9 +311,20 @@ def _canonicalise_clubs(df: pd.DataFrame) -> pd.DataFrame:
     # `nunique()` ignores NaN -- a row with 2.0 and a row with NaN look like agreement. Ranking
     # by how many fields are populated keeps the informative copy every time and makes the
     # choice deterministic rather than incidental.
+    #
+    # ON A TIE, THE PRIMARY SOURCE WINS (fixed 2026-11-16). Equal completeness used to fall back to
+    # input order, and input order came from an unstable date sort over the WHOLE merged frame, so
+    # adding any row anywhere could flip which copy of a tied fixture survived. On 2026-11-16 it
+    # flipped Antwerp v Beerschot VA (2024-09-29): the backtest-archive copy (v9's own derived
+    # backtest output, price timing unknown) beat football-data's copy of the same match, and a
+    # BACKTEST_ARCHIVE row appeared in a football-data season. Rows now carry SOURCE_PRIORITY_COL
+    # (set in load_all_matches), and among equally complete copies the higher-priority source
+    # wins. The priority column is not counted as a populated field. Without it (direct callers)
+    # the rule is the old one.
     before = len(d)
-    d = d.assign(_completeness=d.notna().sum(axis=1))
-    d = (d.sort_values(["date", "_completeness"], kind="mergesort")
+    rank_cols = ["date", "_completeness"] + ([SOURCE_PRIORITY_COL] if SOURCE_PRIORITY_COL in d.columns else [])
+    d = d.assign(_completeness=d.drop(columns=[SOURCE_PRIORITY_COL], errors="ignore").notna().sum(axis=1))
+    d = (d.sort_values(rank_cols, kind="mergesort")
            .drop_duplicates(["date", "league", "home_team", "away_team"], keep="last")
            .drop(columns=["_completeness"]))
     if n_multi or before != len(d) or n_conflict:
@@ -1252,6 +1272,65 @@ def _enrich_ht_scores(df: pd.DataFrame, root: Path | None = None) -> pd.DataFram
     return df
 
 
+
+#: af_history PROVIDER rows the old write-back replaced, restored from git (PR #35) and VERIFIED against
+#: independent sources on data-truth-100 (scripts/verify_af_history_restored_rows.py there: the row's FT
+#: score equals API-Football's for the fixture; a cell differing from API-Football /fixtures/statistics
+#: or impossible is missing; the owner's af_history duplicates are out). Owner 2026-11-16: "yes, make the
+#: models use them". A separate, labelled source (`provenance`, `restored_from_commit` per row);
+#: af_history.parquet is never rewritten.
+AF_RESTORED_ROWS = Path("output") / "corrections" / "af_history_restored_provider_rows_2026-11_verified.parquet"
+_AF_RESTORED_COLS = {"HS": "home_shots", "AS": "away_shots", "HST": "home_sot", "AST": "away_sot",
+                     "HC": "home_corners", "AC": "away_corners", "HF": "home_fouls", "AF": "away_fouls",
+                     "HY": "home_yellows", "AY": "away_yellows", "HXG": "home_xg", "AXG": "away_xg",
+                     "HIB": "home_insidebox", "AIB": "away_insidebox"}
+
+
+def _enrich_af_restored_rows(df: pd.DataFrame, root: Optional[Path] = None) -> pd.DataFrame:
+    """Fill cells STILL MISSING after step 1 from AF_RESTORED_ROWS - nan_only: an existing value is
+    never overwritten, and a cell the verified file does not hold stays missing. League-keyed, the
+    same normalised club key as step 1's safe join; ambiguous cells refused by safe_left_enrich.
+    Absent file -> df unchanged. Per-column filled cells in df.attrs['af_restored_fill']."""
+    p = (root or Path(__file__).resolve().parents[1]) / AF_RESTORED_ROWS
+    if not p.exists():
+        log.info(f"[af_restored] {AF_RESTORED_ROWS.as_posix()} not present - skipped")
+        return df
+    try:
+        from src.api_football_ou import _norm_name
+    except ImportError:
+        _norm_name = lambda x: str(x).lower().strip()            # noqa: E731  (as step 1)
+    try:
+        fill = pd.read_parquet(p)
+        fill = _drop_misfiled_league_rows(fill, "af_restored")
+        vals = [c for c in _AF_RESTORED_COLS if c in fill.columns and _AF_RESTORED_COLS[c] in df.columns]
+        if "league" not in fill.columns or not vals:
+            log.error("[af_restored] no league / stat column - fill SKIPPED")
+            return df
+        df = df.copy()
+        fill = fill[fill[vals].notna().any(axis=1)].copy()
+        for c in vals:
+            fill[c] = pd.to_numeric(fill[c], errors="coerce")
+        k = ["league", "_home_norm", "_away_norm", "_date_str"]
+        fill["_home_norm"] = fill["home_team"].apply(_norm_name)
+        fill["_away_norm"] = fill["away_team"].apply(_norm_name)
+        fill["_date_str"] = pd.to_datetime(fill["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        df["_home_norm"] = df["home_team"].apply(_norm_name)
+        df["_away_norm"] = df["away_team"].apply(_norm_name)
+        df["_date_str"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        df, rep = _IJ.safe_left_enrich(df, fill, keys=k, value_cols=vals,
+                                       target_cols={c: _AF_RESTORED_COLS[c] for c in vals},
+                                       name="af_restored_rows")
+        df.attrs["af_restored_fill"] = {"filled_cells": dict(rep.filled_cells),
+                                        "ambiguous_key_groups": rep.ambiguous_key_groups}
+        log.info(f"[af_restored] verified restored provider rows filled {dict(rep.filled_cells)}; "
+                 f"ambiguous key groups {rep.ambiguous_key_groups}")
+    except Exception as e:                                       # noqa: BLE001
+        log.warning(f"[af_restored] failed to merge {AF_RESTORED_ROWS.as_posix()}: {e}")
+    finally:
+        df = df.drop(columns=["_home_norm", "_away_norm", "_date_str"], errors="ignore")
+    return df
+
+
 def _enrich_with_api_shots(df: pd.DataFrame) -> pd.DataFrame:
     """
     For new-format leagues that have no shot data from football-data.co.uk,
@@ -1348,6 +1427,9 @@ def _enrich_with_api_shots(df: pd.DataFrame) -> pd.DataFrame:
             log.info(f"[af_history] merged backfill: {n_with_shots} rows now have shot data")
         except Exception as e:
             log.warning(f"[af_history] failed to merge af_history.parquet: {e}")
+
+    # ── Step 1a: verified git-restored provider rows fill what is still missing (owner 2026-11-16) ──
+    df = _enrich_af_restored_rows(df)
 
     # ── Step 1b: merge HT scores where they are missing ──────────────────────
     df = _enrich_ht_scores(df)
@@ -1508,35 +1590,11 @@ def _enrich_with_api_shots(df: pd.DataFrame) -> pd.DataFrame:
     # skip-if-populated guard above (xG > 50% for a league) short-circuits the whole fetch. The
     # cost goes from "every run, forever" to "once per genuinely new match".
     #
-    # ONLY rows that actually gained data are written, and only the columns af_history owns, so
-    # this cannot widen the schema or overwrite a real value with a null.
+    # COLUMN-PRESERVING since 2026-11-16 (see bank_af_enrichment): the write-back used to REPLACE
+    # each touched af_history row with a shots-only row, so corners, fouls, cards, the full-time
+    # score and fixture_id of 28,412 provider rows went from present to missing.
     try:
-        _hist_p = Path(__file__).resolve().parents[1] / "output" / "af_history.parquet"
-        _COLMAP = {"home_shots": "HS", "away_shots": "AS", "home_sot": "HST", "away_sot": "AST",
-                   "home_xg": "HXG", "away_xg": "AXG",
-                   "home_insidebox": "HIB", "away_insidebox": "AIB"}
-        _have = [c for c in _COLMAP if c in df.columns]
-        if _have:
-            _new = df[df[_have].notna().any(axis=1)][
-                ["league", "season", "date", "home_team", "away_team"] + _have].copy()
-            _new = _new.rename(columns={k: v for k, v in _COLMAP.items() if k in _have})
-            _prev = pd.read_parquet(_hist_p) if _hist_p.exists() else None
-            _merged = pd.concat([_prev, _new], ignore_index=True) if _prev is not None else _new
-            # Never bank a misfiled row: this write-back is how the archive's Dutch-as-Norway and
-            # Bundesliga-2-as-'Denmark 1st Div' copies got into af_history in the first place.
-            _merged = _drop_misfiled_league_rows(_merged, "af_history write-back")
-            # Newest row wins: a later fetch may fill a column an earlier one left null.
-            _merged = _merged.drop_duplicates(
-                subset=[c for c in ("date", "league", "home_team", "away_team")
-                        if c in _merged.columns], keep="last")
-            for _c in ("league", "season", "home_team", "away_team"):
-                if _c in _merged.columns:
-                    _merged[_c] = _merged[_c].astype(str)
-            _hist_p.parent.mkdir(exist_ok=True)
-            _merged.to_parquet(_hist_p, index=False)
-            log.info(f"[af_history] BANKED enrichment: {len(_merged):,} rows "
-                     f"({len(_merged) - (len(_prev) if _prev is not None else 0):+,} this run). "
-                     f"Next run merges these instead of re-fetching them.")
+        bank_af_enrichment(df)
     except Exception as e:                                       # noqa: BLE001
         # Never fail a training run over the cache. Losing the bank costs time, not correctness.
         log.warning(f"[af_history] could not bank the enrichment: {e}")
@@ -1551,6 +1609,68 @@ def _enrich_with_api_shots(df: pd.DataFrame) -> pd.DataFrame:
         )
 
     return df
+
+
+
+#: af_history columns the enrichment write-back owns (internal name -> af_history name). Nothing else.
+AF_WRITEBACK_COLMAP = {"home_shots": "HS", "away_shots": "AS", "home_sot": "HST", "away_sot": "AST",
+                       "home_xg": "HXG", "away_xg": "AXG",
+                       "home_insidebox": "HIB", "away_insidebox": "AIB"}
+AF_HISTORY_KEY = ["league", "date", "home_team", "away_team"]
+
+
+def bank_af_enrichment(df: pd.DataFrame, hist_path: Optional[Path] = None) -> dict:
+    """Bank the shot / xG enrichment of FINISHED matches into output/af_history.parquet - without
+    losing anything the bank does not own.
+
+    THE DATA-LOSS BUG (fixed 2026-11-16). This was `concat([stored, new]).drop_duplicates(key,
+    keep="last")` with `new` carrying ONLY the eight shot / xG columns. Every stored row whose key the
+    loader touched - which is every history row the step-1 merge had matched - was REPLACED by a
+    shots-only row: its corners, fouls, cards, full-time score and (from PR #34) fixture_id went from
+    present to missing, and a null xG in the frame erased a stored one. Git history shows 28,412
+    provider rows lost that way (restored beside the file:
+    output/corrections/af_history_restored_provider_rows_2026-11.parquet).
+
+    NOW (src/integrity/preserving_upsert, mode "fill"): rows are merged by (league, date, home, away);
+    for a stored row only the eight owned columns may change, and only where the stored cell is
+    MISSING - a stored provider value is never overwritten by a loader value (football-data's shot
+    count is not API-Football's) and never erased. A key the bank does not hold is appended with every
+    other column missing (never a default). No stored row or column is ever dropped: a misfiled-league
+    row is refused from the NEW rows only. Nothing to add -> the file is not rewritten at all."""
+    from src.integrity.preserving_upsert import upsert
+    hist_path = Path(hist_path) if hist_path is not None else (
+        Path(__file__).resolve().parents[1] / "output" / "af_history.parquet")
+    have = [c for c in AF_WRITEBACK_COLMAP if c in df.columns]
+    if not have:
+        return {"written": False, "reason": "no owned column in frame"}
+    new = df[df[have].notna().any(axis=1)][
+        [c for c in ["league", "season", "date", "home_team", "away_team"] if c in df.columns] + have].copy()
+    new = new.rename(columns={k: v for k, v in AF_WRITEBACK_COLMAP.items() if k in have})
+    # Never bank a misfiled row: this write-back is how the archive's Dutch-as-Norway and
+    # Bundesliga-2-as-'Denmark 1st Div' copies got into af_history in the first place.
+    new = _drop_misfiled_league_rows(new, "af_history write-back")
+    for c in ("league", "season", "home_team", "away_team"):
+        if c in new.columns:                                # text, but a missing cell stays missing
+            new[c] = new[c].where(new[c].isna(), new[c].astype(str))
+    new["date"] = pd.to_datetime(new["date"], errors="coerce")
+    new = new[new["date"].notna()]
+    owned = [AF_WRITEBACK_COLMAP[c] for c in have]
+    prev = pd.read_parquet(hist_path) if hist_path.exists() else None
+    # `season` is filled only where the stored row has none; it is part of a NEW row's identity.
+    merged, rep = upsert(prev, new, key=AF_HISTORY_KEY, owned=owned + (["season"] if "season" in new else []),
+                         mode="fill", date_keys=("date",))
+    if prev is not None and not rep.changed:
+        log.info("[af_history] bank: nothing new to add - file left untouched")
+        return {"written": False, "rows": int(len(prev)), "appended": 0, "cells_filled": {}}
+    hist_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = hist_path.with_suffix(".tmp.parquet")
+    merged.to_parquet(tmp, index=False)
+    os.replace(tmp, hist_path)
+    log.info(f"[af_history] BANKED enrichment (column-preserving): {len(merged):,} rows, "
+             f"{rep.appended_rows:+,} appended, cells filled {rep.cells_changed}. "
+             f"No stored row or column dropped.")
+    return {"written": True, "rows": int(len(merged)), "appended": rep.appended_rows,
+            "cells_filled": dict(rep.cells_changed)}
 
 
 def load_all_matches(xlsx_path: Optional[Path] = None, force: bool = False) -> pd.DataFrame:
@@ -1734,15 +1854,23 @@ def load_all_matches(xlsx_path: Optional[Path] = None, force: bool = False) -> p
             raise RuntimeError(
                 "CI download failed and no cached history is available "
                 f"({cache_p.name} missing or empty) — no data loaded")
-        ci_frames.extend(_load_api_football_only_leagues())
+        _af_frames = list(_load_api_football_only_leagues())
+        ci_frames.extend(_af_frames)
         # The archive goes in BEFORE club canonicalisation, which is the whole reason it can go
         # in at all: the unifier resolves its club vocabulary against football-data's.
         _arch = _load_backtest_archive()
         if len(_arch):
             ci_frames.append(_arch)
-        out = pd.concat(ci_frames, ignore_index=True)
+        # Source priority for the duplicate tie-break in _canonicalise_clubs (dropped right after).
+        _prio = {id(f): SOURCE_PRIORITY["football_data_download"] for f in _downloaded}
+        _prio.update({id(f): SOURCE_PRIORITY["api_football"] for f in _af_frames})
+        if len(_arch):
+            _prio[id(_arch)] = SOURCE_PRIORITY["backtest_archive"]
+        out = pd.concat([f.assign(**{SOURCE_PRIORITY_COL: _prio.get(id(f), SOURCE_PRIORITY["football_data_cache"])})
+                         for f in ci_frames], ignore_index=True)
         out = out[out["home_team"].notna() & out["away_team"].notna()]
-        out = out.sort_values("date").reset_index(drop=True)
+        # STABLE: equal dates keep concat order, so the order never depends on unrelated rows.
+        out = out.sort_values("date", kind="mergesort").reset_index(drop=True)
         out["total_goals"] = out["home_goals"] + out["away_goals"]
         out["over25"] = (out["total_goals"] > 2.5).astype(float)
         out["over15"] = (out["total_goals"] > 1.5).astype(float)
@@ -1773,6 +1901,7 @@ def load_all_matches(xlsx_path: Optional[Path] = None, force: bool = False) -> p
         # Club identity BEFORE any enrichment or feature work: a club split across two
         # spellings is two teams to everything downstream.
         out = _canonicalise_clubs(out)
+        out = out.drop(columns=[SOURCE_PRIORITY_COL], errors="ignore")
         out = _canonical_identity_and_seasons(out)
         out = _enrich_with_api_shots(out)
         out = _enrich_with_standard_sidemarket_odds(out)   # real BTTS/O1.5/O3.5 for 2nd-divs
