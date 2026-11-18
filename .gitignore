@@ -13,6 +13,7 @@ __pycache__/
 # whole data directories (no code file lives in them)
 /models/
 /output/
+/reports/
 # individual data files
 /config/auto_leagues.json
 /config/bankroll_policy.json
