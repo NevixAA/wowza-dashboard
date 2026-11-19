@@ -23,4 +23,3 @@ __pycache__/
 /config/threshold_applied.json
 /config/threshold_approvals.json
 /config/track_registry.json
-/config/trustworthy_performance.json
