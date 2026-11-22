@@ -18,8 +18,10 @@ __pycache__/
 /config/auto_leagues.json
 /config/bankroll_policy.json
 /config/league_market_regimes.json
+/config/price_store_paths.json
 /config/promotion_gate.json
 /config/research_lock_snapshot.json
+/config/research_tracker.json
 /config/threshold_applied.json
 /config/threshold_approvals.json
 /config/track_registry.json
