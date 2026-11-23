@@ -68,6 +68,12 @@ COLUMNS = [
     # Owner rule 2026-10-22: a close counts only within 30 min of kickoff. A price observed earlier
     # is kept here (grading-only, never a close) so the observation is not lost.
     "last_pre_kickoff_odds",
+    # ENTRY BOOK (owner 2026-11-23, appended): the OddsAPI book key whose price is entry_odds, written at
+    # first sight by predict so a same-book close can grade it. Rows before stay blank (unknown).
+    "entry_bookmaker",
+    # ENTRY CAPTURE TIME (owner 2026-11-23 "Yes, do all", D6, appended): the UTC time of the provider call behind
+    # entry_odds (predict's odds_over25_captured_at / odds_under25_captured_at). Rows before stay blank (unknown).
+    "entry_captured_at",
 ]
 
 #: Columns that are knowable only AFTER the bet. §6: they may grade a signal, never select one.
@@ -85,11 +91,32 @@ FROZEN = tuple(c for c in COLUMNS if c not in GRADING_ONLY and c not in IDENTITY
 #: First-sight columns added to the file AFTER system_health began recording its daily frozen digest of
 #: v91_shadow.csv. They are frozen for settlement (FROZEN) but kept out of that cross-day digest: the rows
 #: already recorded never held them, so hashing them would report every recorded row as rewritten.
-LATE_FIRST_SIGHT = ("p_v9_served",)                                  # 2026-11-22
+# entry_bookmaker (2026-11-23, PR #87) and entry_captured_at (D6, 2026-11-23) join it for the same reason.
+LATE_FIRST_SIGHT = ("p_v9_served", "entry_bookmaker", "entry_captured_at")
+
+
+def _identity(fixture_id, market, match_date) -> list[tuple]:
+    """The canonical first-sight key of a shadow row: (provider fixture id, market).
+
+    THE MATCH DATE IS NOT PART OF IT (2026-11-23). It was until then, so a fixture whose provider
+    kick-off moved to another date (Rosario Central v Barracas Central and Velez Sarsfield BA v
+    Independiente, 2026-11-28 15:00 -> 2026-11-29 00:00 UTC) failed the "seen" test and was logged a
+    second time by a later predict run - a later model's opinion beside the first-sight one, which is
+    exactly what the freeze exists to prevent (data truth 9: "v91_shadow fixture(s) logged twice").
+    The fixture id identifies the match across a reschedule; settlement applies the 48 h rule to the
+    first-sight row. A row without a fixture id (none today) falls back to the old (id, market, date) key
+    so two unidentified fixtures are never merged.
+    """
+    out = []
+    for f, m, d in zip(fixture_id, market, match_date):
+        fid = "" if f is None or (isinstance(f, float) and np.isnan(f)) else str(f).strip()
+        fid = "" if fid.lower() in ("nan", "none", "<na>") else fid
+        out.append((fid, m) if fid else ("", m, str(d)[:10]))
+    return out
 
 
 def append_shadow(rows: list[dict] | pd.DataFrame) -> int:
-    """Append fixtures to the shadow log, deduped on (fixture_id, match_date).
+    """Append fixtures to the shadow log, deduped on (fixture_id, market) - first write wins.
 
     APPEND-ONLY AND DEDUPED ON FIRST SIGHT. A logged opinion is evidence precisely because it
     cannot be revised once the result is known. predict runs every 15 minutes, so without the
@@ -118,6 +145,10 @@ def append_shadow(rows: list[dict] | pd.DataFrame) -> int:
         return (series.astype("object").where(series.notna(), "ou25").astype(str)
                 .str.strip().replace({"": "ou25", "nan": "ou25", "None": "ou25"}))
 
+    # ONE ROW PER FIXTURE x MARKET INSIDE THE BATCH TOO (first row wins).
+    df = df[~pd.Series(_identity(df["fixture_id"], _mkt(df["market"]), df["match_date"]),
+                       index=df.index).duplicated()]
+
     if SHADOW_FILE.exists():
         # dtype=str: the existing rows are copied through VERBATIM. A typed read would
         # re-render every settled cell on every predict run ("2" goals -> "2.0", float noise),
@@ -125,13 +156,9 @@ def append_shadow(rows: list[dict] | pd.DataFrame) -> int:
         old = pd.read_csv(SHADOW_FILE, dtype=str)
         if "market" not in old.columns:
             old["market"] = "ou25"
-        seen = set(zip(old["fixture_id"].astype(str), _mkt(old["market"]),
-                       old["match_date"].astype(str).str[:10]))
-        new_mkt = _mkt(df["market"])
-        keep = ~pd.Series(
-            [(str(f), m, str(d)[:10]) in seen
-             for f, m, d in zip(df["fixture_id"], new_mkt, df["match_date"])],
-            index=df.index)
+        seen = set(_identity(old["fixture_id"], _mkt(old["market"]), old["match_date"]))
+        keep = ~pd.Series([k in seen for k in _identity(df["fixture_id"], _mkt(df["market"]), df["match_date"])],
+                          index=df.index)
         df = df[keep]
         if df.empty:
             return 0
