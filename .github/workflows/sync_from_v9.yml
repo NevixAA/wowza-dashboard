@@ -12,7 +12,15 @@ name: Sync from v9
 #   3. mirror it over this repo with --delete, so a file v9 drops from the manifest (stale,
 #      pipeline-only) disappears here too. .git and .github (this workflow) are kept,
 #   4. commit only when a code or manifest file changed. BUILD_INFO.json and README.md carry a
-#      build timestamp, so on their own they are not a reason to commit.
+#      build timestamp, so on their own they are not a reason to commit,
+#   5. push; if main moved meanwhile, never rebase the generated commit (README.md / BUILD_INFO.json
+#      always conflict): reset to the new main, rebuild from the same v9 checkout, re-commit only on a
+#      real change, push again (5 attempts, never forced). Steps 2-5 are .github/scripts/sync_from_v9.sh.
+#
+# The concurrency group runs one sync at a time, but a queued run is created against the main SHA of
+# its event, not the tip when it starts. So the slim checkout pins ref: main (the tip at job start), and
+# the push in step 5 heals the rest (2026-11-24 16:21: two dispatches 40 s apart, the second started on
+# the pre-push SHA, its pull --rebase conflicted and the loop retried on unmerged files until it failed).
 #
 # Never edit files here by hand: fix them in wowza-betting and let this run (or dispatch it).
 
@@ -37,6 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main     # the tip when the job starts, not the (older) SHA a queued event was created on
           path: slim
 
       - name: Check out v9 main (read-only)
@@ -51,24 +60,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Build the slim tree with v9's generator
-        run: python _v9/scripts/build_dashboard_repo.py "$RUNNER_TEMP/build"
-
-      - name: Mirror it over this repo (keep .git and .github)
-        run: rsync -a --delete --exclude '/.git' --exclude '/.github' "$RUNNER_TEMP/build/" slim/
-
-      - name: Commit if code changed
-        working-directory: slim
+      - name: Build, mirror, commit if code changed, push (self-healing)
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet -- . ':(exclude)deploy/BUILD_INFO.json' ':(exclude)README.md'; then
-            echo "in sync with v9 main (only build stamps differ) - nothing to commit"
-            exit 0
-          fi
-          git diff --cached --stat
-          sha=$(git -C ../_v9 rev-parse --short HEAD)
-          git commit -m "Sync from v9 ${sha}: dashboard manifest files"
-          for i in 1 2 3 4 5; do git pull --rebase origin main && git push && exit 0; sleep 5; done
-          exit 1
+          git -C slim config user.name  "github-actions[bot]"
+          git -C slim config user.email "github-actions[bot]@users.noreply.github.com"
+          # run a copy: the script resets slim/ to a newer main on retry, which must not rewrite it mid-run
+          cp slim/.github/scripts/sync_from_v9.sh "$RUNNER_TEMP/sync_from_v9.sh"
+          bash "$RUNNER_TEMP/sync_from_v9.sh" _v9 slim "$RUNNER_TEMP/build" 5
