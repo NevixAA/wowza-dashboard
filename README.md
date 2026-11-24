@@ -8,7 +8,7 @@ a whole. Any hand edit here is overwritten by the next build: change the code in
 * Data: NOT in this repo. `dashboard_data/remote_mirror.py` downloads the manifest's data files from
   `https://raw.githubusercontent.com/NevixAA/wowza-betting/main/<path>` into the same relative paths
   at startup and then at most every 10 minutes (the `deploy/SLIM` marker switches it on).
-* Built from v9 commit: `304c85eaff4c911a8e19869f555aa60a71b91205` at 2026-11-24T17:21:20Z. Build id `a1d053789913fae0`, dashboard schema 1.
+* Built from v9 commit: `ca0d2c0ea326c0eb3df403b0fb01ebb6ba7091d4` at 2026-11-24T17:57:56Z. Build id `4b7e178173d86e10`, dashboard schema 1.
 * Code/data skew: `deploy/BUILD_INFO.json` records this build; the app compares it with v9's manifest
   at the mirrored data SHA and warns (STALE_BUILD / INCOMPATIBLE / UNKNOWN) when they disagree.
 
