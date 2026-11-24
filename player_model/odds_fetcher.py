@@ -1,0 +1,1423 @@
+"""
+Player Prop Odds Fetcher
+========================
+Fetches player-level prop odds from The Odds API and returns a dict
+compatible with enrich_with_odds(): {"PlayerName|market": best_decimal_odds}
+
+Markets fetched:
+  goals   → player_goal_scorer_anytime   (1+ goals)
+  goals2  → player_to_score_2_or_more    (2+ goals)
+  sot     → player_shots_on_target       (Over 0.5)
+  sot2    → player_shots_on_target       (Over 1.5)
+  sot3    → player_shots_on_target       (Over 2.5 = 3+ SOT)
+  sot4    → player_shots_on_target       (Over 3.5 = 4+ SOT; research only, 0.27% base rate)
+  assists → player_assists (Over 0.5)    (1+ assist; falls back to calibration if no market)
+  cards   → player_to_receive_card
+  (goals3 removed — base rate too low. sot4 RESTORED 2026-08-27: it rides the same
+   player_shots_on_target response, so the price costs nothing, and a prop price is pre-match
+   only. goals2 stays MODELLED but unpriceable — no source sells a player 2+ goals market.)
+
+Two price sources, one set of files: OddsAPI first, then player_model/prop_odds_af for the
+leagues OddsAPI does not sell props for. See that module's docstring.
+
+Cost: 1 API call per event (events list is free).
+Only fetches events where we have signals in player_tips.csv.
+"""
+from __future__ import annotations
+
+import re
+import unicodedata
+import os
+import json
+from pathlib import Path
+from typing import Optional
+
+import requests
+
+from . import config as _pm_config
+
+_BASE ="https://api.the-odds-api.com/v4"
+
+# Bookmaker regions to request. EU books barely price player props outside the top
+# five leagues — the deep prop market for English and German football is the UK
+# books (bet365, Sky Bet, William Hill, Paddy Power). Asking for "eu" alone is why
+# 9 of the 12 leagues in PROP_SPORT_KEYS had never returned a single price by
+# 2026-08-16, and why the World Cup accounted for 91% of all prop odds ever fetched.
+# OddsAPI bills [markets x regions], so adding a region roughly doubles per-event
+# cost; at our volume (a few hundred calls in seven weeks) that is immaterial.
+#
+# WIDENED TO uk,eu,us,us2 ON 2026-08-27, because "uk,eu" was collecting under half of what is
+# available. OddsAPI's own documentation says prop coverage is "currently limited to US
+# bookmakers", and measuring one Premier League fixture confirms it:
+#
+#     uk,eu          ->  4 books,   459 player quotes   <- what we were asking for
+#     us             ->  8 books,   478
+#     uk,eu,us,us2   -> 15 books, 1,155                 <- 2.5x the prices
+#
+# More books is not just more rows: it is the difference between a single price and an actual
+# consensus, which is what any no-vig or best-executable-price calculation needs. Cost roughly
+# doubles per event and the monthly plan is at 67.9% with 4 days left, so there is headroom;
+# revert via the env var if usage tightens.
+#
+# NARROWED BACK TO uk,eu ON 2026-09-05, AFTER IT COST THE REAL TIPS. The measurement above is
+# correct and the headroom reasoning was correct FOR THAT MONTH — it was taken with the plan at
+# 67.9% and four days left, so the wider ask never had to survive a full cycle. On the fresh
+# September quota it did: OddsAPI credits were exhausted by 09-04, predict went from 19/19
+# leagues and 195 fixtures at 04:26 to 0/19 and zero fixtures by 09:56, and NO TIPS WERE SENT
+# until the plan was topped up.
+#
+# The deciding argument is not the price count, it is what the two products are worth:
+#
+#   * Player props are PAPER ONLY, PERMANENTLY (root CLAUDE.md invariant 2). Their accuracy is
+#     real and their betting edge is not; they are monetised through the no-vig Fantasy family.
+#   * The 2nd-division O/U market is where actual money goes, and it depends on the SAME
+#     OddsAPI quota.
+#
+# So a paper product quadrupled the burn rate on the credit pool the staked product needs. More
+# books buys a better consensus for research; running out of credits buys nothing and stops the
+# tips. That is not a trade worth making, however good the coverage numbers look in isolation.
+#
+# Widen again deliberately — PROP_ODDS_REGIONS=uk,eu,us,us2 — when the plan has measured headroom
+# across a WHOLE billing cycle, not the tail of one.
+_REGIONS = os.getenv("PROP_ODDS_REGIONS", "uk,eu").strip() or "uk,eu"
+
+# How long to trust a cached response. An empty bookmaker list is NOT proof the
+# fixture will never be priced: books post prop markets progressively as kickoff
+# approaches. Hull City v Man United carried only anytime-goalscorer 7 days out,
+# while Espanyol v Levante carried all 6 markets 3 days out. So an early empty
+# means "not posted yet" and can be held a long time, but once the fixture is
+# close an empty must be re-checked often or we miss the window entirely.
+CACHE_TTL_PRICED = 7200       # 2h  — live prices move, keep it short
+CACHE_TTL_EMPTY_NEAR = 7200   # 2h  — inside 48h of kickoff, markets are appearing
+CACHE_TTL_EMPTY_FAR = 86400   # 24h — days out, an empty list says "too early"
+_NEAR_KICKOFF_HOURS = 48
+
+
+def hours_to_kickoff(commence_time: str) -> float | None:
+    """Hours until kickoff, or None when the timestamp is unusable.
+
+    Shared by the cache TTL and the coverage park streak so the two cannot disagree about how
+    far out a probe was. None means UNKNOWN and callers must treat it as such — never as zero.
+    """
+    from datetime import datetime, timezone
+    try:
+        ko = datetime.fromisoformat(str(commence_time).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    return (ko - datetime.now(timezone.utc)).total_seconds() / 3600.0
+
+
+def _empty_ttl_for(commence_time: str) -> int:
+    """TTL for an empty bookmaker list, scaled by time to kickoff."""
+    hours = hours_to_kickoff(commence_time)
+    if hours is None:
+        return CACHE_TTL_EMPTY_NEAR      # unknown kickoff -> re-check sooner
+    return CACHE_TTL_EMPTY_NEAR if hours <= _NEAR_KICKOFF_HOURS else CACHE_TTL_EMPTY_FAR
+
+# Maps our market names → Odds API market key + Over point (None = binary yes/no)
+_MARKET_MAP = {
+    "goals":   ("player_goal_scorer_anytime",  None),  # 1+ goals
+    # goals2 / `player_to_score_2_or_more` RETIRED 2026-08-18. OddsAPI rejects it as an
+    # invalid market on every soccer event — 0 prices in the entire odds history — and the
+    # self-heal below then dropped it and re-requested, costing an extra call per event.
+    # Its model cap (0.0878) was also below config.MIN_SIGNAL_PROB, so it could never tip.
+    "sot":     ("player_shots_on_target",      0.5),   # 1+ SOT
+    "sot2":    ("player_shots_on_target",      1.5),   # 2+ SOT
+    "sot3":    ("player_shots_on_target",      2.5),   # 3+ SOT
+    # 4+ SOT. Arrives on the SAME player_shots_on_target response as the lines above,
+    # so it costs no extra API call. Research data only -- see the base rates in
+    # player_model/config.py next to MARKETS.
+    "sot4":    ("player_shots_on_target",      3.5),   # 4+ SOT
+    "assists": ("player_assists",              0.5),   # Over 0.5 = 1+ assist (OddsAPI key is player_assists, Over/Under)
+    "cards":   ("player_to_receive_card",      None),  # yellow card
+}
+# Unique API market keys to request in one call (avoids requesting same key multiple times)
+_API_MARKETS_STR = ",".join(dict.fromkeys(v[0] for v in _MARKET_MAP.values()))
+
+# Markets not available for WC on OddsAPI (returns 422 if requested)
+_WC_EXCLUDED_API_MARKETS = {"player_to_score_2_or_more", "player_assists"}
+_WC_API_MARKETS_STR = ",".join(
+    k for k in dict.fromkeys(v[0] for v in _MARKET_MAP.values())
+    if k not in _WC_EXCLUDED_API_MARKETS
+)
+_WC_SPORT_KEY = "soccer_fifa_world_cup"
+
+# Odds API sport keys for our prop leagues. DERIVED FROM THE REGISTRY (Data Truth, LR-1.1):
+# {canonical league: primary OddsAPI key} for every `props: true` league with a key
+# (src.league_registry.prop_sport_keys). The hand table that lived here was copied into
+# config/leagues.json; alias lookups ("World Cup") still resolve through the LeagueMap.
+# NOTE: the registry lists a key for every prop league that has one, so leagues the old table
+# omitted (e.g. Ligue 2, La Liga 2, the Nordics) are now asked too; prop_odds_coverage.json
+# parks any league that prices nothing after _COVERAGE_MIN_PROBES events.
+PROP_SPORT_KEYS = _pm_config.league_registry().prop_sport_keys()
+
+_CACHE_DIR = Path(__file__).resolve().parents[1] / "prop_odds_cache"
+_CACHE_DIR.mkdir(exist_ok=True)
+
+# Append-only history of every fetched player-prop odd (built forward, ~free —
+# we already fetch these). Becomes the real-odds dataset for prop backtests.
+_ODDS_HISTORY_FILE = Path(__file__).resolve().parents[1] / "output" / "player_prop_odds_history.csv"
+# One price QUOTE = (fixture, player, market, source, bookmaker, snapshot time, price). The key used
+# to stop at the price, so two books quoting the same number collapsed into whichever was seen first
+# and a book that went 2.0 -> 2.2 -> 2.0 lost its return to 2.0: its "last price" in the file was a
+# price it no longer offered (props_truth, 2026-11-02). Consecutive identical quotes of ONE book are
+# collapsed by _collapse_price_runs (the file still grows only when a book moves its price).
+_ODDS_BOOK_KEY = ["match_date", "league", "match", "player", "market", "source", "bookmaker"]
+_ODDS_HISTORY_KEY = _ODDS_BOOK_KEY + ["snapshot_ts", "odds"]
+# Every primary AND extra key (UCL qualification -> "Champions League") -> canonical league.
+SPORT_KEY_TO_LEAGUE = _pm_config.league_registry().sport_key_to_league()
+
+# Learned per-league prop-market coverage. Rather than hardcoding a guess about
+# which competitions offer player props, record what OddsAPI actually returns and
+# park the leagues that never price anything. Committed by the props workflow so
+# the knowledge survives across CI runs (the repo is the database).
+_COVERAGE_FILE = Path(__file__).resolve().parents[1] / "output" / "prop_odds_coverage.json"
+_COVERAGE_MIN_PROBES = 12   # consecutive events with no bookmaker before parking
+_COVERAGE_RETRY_DAYS = 7    # ...and how long before we probe it again anyway
+
+
+def validate_sport_keys(*, quiet: bool = False) -> dict[str, str]:
+    """Check every PROP_SPORT_KEYS value against OddsAPI's own catalogue.
+
+    Exists because a wrong key fails SILENTLY in the worst possible way: the events call
+    returns 404 UNKNOWN_SPORT, the fetcher logs one line and moves on, and the league simply
+    never has props. "Ligue 1" carried soccer_france_ligue_1 — a key that does not exist —
+    for the entire life of the file, and nothing surfaced it. A key that is merely
+    out of season is DIFFERENT and fine: it is valid with active=False, which is how the
+    World Cup and the UEFA competitions look right now.
+
+    The /v4/sports endpoint is FREE and does not consume quota, so this can run on every
+    props run without cost.
+
+    Returns {league: verdict} where verdict is VALID_ACTIVE / VALID_INACTIVE / UNKNOWN_KEY.
+    """
+    key = _load_odds_key()
+    if not key:
+        return {}
+    try:
+        r = requests.get(f"{_BASE}/sports", params={"apiKey": key, "all": "true"}, timeout=30)
+        if r.status_code != 200:
+            return {}
+        catalogue = {s["key"]: s for s in r.json()}
+    except Exception as e:
+        if not quiet:
+            print(f"[odds_fetcher] sport-key validation skipped ({e})")
+        return {}
+
+    out: dict[str, str] = {}
+    bad: list[str] = []
+    for league, sk in PROP_SPORT_KEYS.items():
+        entry = catalogue.get(sk)
+        if entry is None:
+            out[league] = "UNKNOWN_KEY"
+            bad.append(f"{league} -> {sk}")
+        else:
+            out[league] = "VALID_ACTIVE" if entry.get("active") else "VALID_INACTIVE"
+    if bad and not quiet:
+        print(f"[odds_fetcher] *** {len(bad)} sport key(s) DO NOT EXIST in OddsAPI — these "
+              f"leagues can never return props: {bad} ***")
+    return out
+
+
+def _load_coverage() -> dict:
+    try:
+        return json.loads(_COVERAGE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_coverage(cov: dict) -> None:
+    try:
+        _COVERAGE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _COVERAGE_FILE.write_text(
+            json.dumps(cov, indent=2, sort_keys=True), encoding="utf-8"
+        )
+    except Exception as e:
+        print(f"[odds_fetcher] coverage save skipped: {e}")
+
+
+def _coverage_parked(cov: dict, sport_key: str, today: str) -> bool:
+    """True when a league has returned nothing but empty bookmaker lists for
+    _COVERAGE_MIN_PROBES straight events and we last probed it under
+    _COVERAGE_RETRY_DAYS ago. Parking is never permanent: a book that adds the
+    market is picked up on the next weekly retry, so this answers 'does the
+    Championship have props?' from evidence instead of assumption."""
+    from datetime import date
+    c = cov.get(sport_key)
+    if not c or int(c.get("empty_streak", 0)) < _COVERAGE_MIN_PROBES:
+        return False
+    last = str(c.get("last_probe") or "")[:10]
+    try:
+        return (date.fromisoformat(today) - date.fromisoformat(last)).days < _COVERAGE_RETRY_DAYS
+    except Exception:
+        return False
+
+
+def _coverage_fixtures(cov: dict, sport_key: str, today: str,
+                       wanted: int, matched: int, unmatched: list[str]) -> None:
+    """Record how many of the fixtures we wanted were even FOUND in OddsAPI's event
+    list. Without this, 'no odds' has two indistinguishable causes: the book offers
+    no props (empty bookmakers, an odds call is spent) or our fixture name never
+    matched an event (no call is made at all, because the event loop just skips).
+    Those need opposite fixes, so never let the second masquerade as the first."""
+    c = cov.setdefault(sport_key, {})
+    c["league"] = SPORT_KEY_TO_LEAGUE.get(sport_key, sport_key)
+    c["wanted_fixtures"] = wanted
+    c["matched_events"] = matched
+    c["unmatched_sample"] = unmatched
+    if wanted and not matched:
+        c["last_all_unmatched"] = today
+        print(f"[odds_fetcher] {sport_key}: NAME MISMATCH — {wanted} fixture(s) wanted, "
+              f"0 found in the event list, so no odds call was made. "
+              f"Unmatched: {unmatched}")
+
+
+# An empty probe only counts toward PARKING if it was taken close enough to kickoff that a
+# real market should already exist. See _coverage_record.
+_COVERAGE_STREAK_WINDOW_H = 24.0
+
+
+def _coverage_record(cov: dict, sport_key: str, today: str, priced: bool,
+                     hours_to_kickoff: float | None = None) -> None:
+    """Record one probe. An empty result only extends the PARK STREAK when it was taken
+    inside `_COVERAGE_STREAK_WINDOW_H` of kickoff.
+
+    WHY, because this was a self-fulfilling gap. Parking counted 12 consecutive empty probes
+    with no notion of time-to-kickoff. Lower divisions post player props late, so probes taken
+    three to five days out come back empty CORRECTLY — the market is not open yet. Twelve of
+    those parked the league for seven days, parking skips it entirely (the `continue` in the
+    fetch loop happens before the event call), and the weekly retry lands on whatever day it
+    lands. Once parked, a league could never be probed on a match day again.
+
+    Measured on 2026-08-27: Championship 24 empty probes and PARKED until 2026-09-01, with
+    fixtures being played on 08-28. Premier League, which prices early, had 807 probes and had
+    never parked. So the ledger was recording OUR PROBING SCHEDULE and presenting it as the
+    market's behaviour — the opposite of what it exists for.
+
+    Probes further out are still counted in `probes` and still logged; they just cannot park a
+    league. `far_empty_probes` keeps them visible so "we looked 40 times, all of them early" is
+    distinguishable from "we never looked".
+    """
+    c = cov.setdefault(sport_key, {})
+    c["league"] = SPORT_KEY_TO_LEAGUE.get(sport_key, sport_key)
+    c["probes"] = int(c.get("probes", 0)) + 1
+    c["last_probe"] = today
+    if priced:
+        c["empty_streak"] = 0
+        c["last_priced"] = today
+        c["priced_events"] = int(c.get("priced_events", 0)) + 1
+        return
+    # Unknown time-to-kickoff is treated as TOO FAR: it must not be able to park a league,
+    # because an unknown is not evidence that the market was open.
+    near = hours_to_kickoff is not None and hours_to_kickoff <= _COVERAGE_STREAK_WINDOW_H
+    if near:
+        c["empty_streak"] = int(c.get("empty_streak", 0)) + 1
+        c["last_near_empty"] = today
+    else:
+        c["far_empty_probes"] = int(c.get("far_empty_probes", 0)) + 1
+
+
+_QUOTES_DIR = Path(__file__).resolve().parents[1] / "output" / "prop_quotes"
+_QUOTE_KEY = ["match_date", "league", "match", "player", "market", "side", "point", "bookmaker", "odds"]
+_QUOTES_LOOKBACK_DAYS = 14          # dedupe window across day-files (a fixture is quoted <~10 days)
+
+
+def _price(o: dict) -> float | None:
+    """A provider outcome's decimal price, or None when it sends none / an unparseable one (never 0)."""
+    v = o.get("price")
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _keep_best(best: dict, key, price: float) -> None:
+    """best[key] = the highest price seen for key (a key not seen yet takes its first price)."""
+    if key not in best or price > best[key]:
+        best[key] = price
+
+
+def _quotes_from_oddsapi(bookmakers: list, match_date: str, league: str, match: str) -> list[dict]:
+    """Every bookmaker's quote, BOTH sides, for the markets we model (logging only)."""
+    inv = {(k, p): our for our, (k, p) in _MARKET_MAP.items()}
+    out = []
+    for bm in bookmakers or []:
+        book = bm.get("title") or bm.get("key") or ""
+        for mkt in bm.get("markets", []):
+            for o in mkt.get("outcomes", []):
+                pt = o.get("point")
+                try:
+                    pt = float(pt) if pt is not None else None
+                except (TypeError, ValueError):
+                    continue
+                our = inv.get((mkt.get("key"), pt))
+                if our is None:
+                    continue
+                # No price / no side from the provider -> no quote. They were read as price 0 (then
+                # dropped by the > 1.0 test) and side "yes" (kept: a nameless outcome was logged as
+                # the YES side). fix9/defaults 2026-11-04.
+                price = _price(o)
+                if price is None or price <= 1.0 or o.get("name") is None:
+                    continue
+                out.append({"match_date": match_date, "league": league, "match": match,
+                            "player": _norm(o.get("description", "")), "market": our,
+                            "side": str(o["name"]).lower(), "point": pt, "odds": price,
+                            "bookmaker": book, "source": "oddsapi"})
+    return out
+
+
+# ── REAL TWO-SIDED PRICES (owner decision 2026-11-05) ─────────────────────────────────────
+# A tip's fair probability comes from de-vigging a REAL pair when one exists: the tip's side
+# (Yes / Over at the tip's line) and the other side (No / Under at the same line) from the SAME
+# bookmaker in the SAME provider answer (one fetch = one snapshot). Power de-vig
+# (src.market_edge.power_devig, as the side markets use), median over the books that quoted both.
+# Only when no such pair exists does predict fall back to the ASSUMED overround. A side whose name
+# is not one of these four words never forms a pair.
+_PAIR_SIDE = {"yes": "a", "over": "a", "no": "b", "under": "b"}
+
+
+def _power_devig(odds_a: float, odds_b: float) -> Optional[float]:
+    return _pm_config._v9_src("market_edge").power_devig(odds_a, odds_b)
+
+
+def _add_fixture_pairs(fixture_pairs: dict, match_date, match, quotes: list[dict]) -> int:
+    """Add the two-sided pairs in `quotes` (ONE provider answer for ONE fixture) to fixture_pairs:
+    {(match_date, our "home vs away"): {"<norm player>|<market>": [pair, ...]}}. Returns pairs added.
+
+    A pair needs exactly one price per side in that book (a book quoting two different Yes prices
+    for one player in one answer is ambiguous, so it gives no pair) and both sides at the same line."""
+    if not quotes or not match:
+        return 0
+    sides: dict[tuple, dict[str, set]] = {}
+    for q in quotes:
+        side = _PAIR_SIDE.get(str(q.get("side") or "").strip().lower())
+        player = _norm(str(q.get("player") or ""))
+        try:
+            odds = float(q.get("odds"))
+        except (TypeError, ValueError):
+            continue
+        if side is None or not player or not q.get("market") or not (odds > 1.0):
+            continue
+        pt = q.get("point")
+        try:
+            pt = None if pt is None or pt != pt else round(float(pt), 2)
+        except (TypeError, ValueError):
+            continue
+        k = (player, str(q["market"]), pt, str(q.get("bookmaker") or ""))
+        sides.setdefault(k, {"a": set(), "b": set()})[side].add(odds)
+    added = 0
+    fx = None
+    for (player, market, pt, book), s in sides.items():
+        if len(s["a"]) != 1 or len(s["b"]) != 1:
+            continue                                    # one side missing, or ambiguous
+        oa, ob = next(iter(s["a"])), next(iter(s["b"]))
+        p = _power_devig(oa, ob)
+        if p is None:
+            continue
+        if fx is None:
+            fx = fixture_pairs.setdefault((str(match_date or "")[:10], str(match)), {})
+        fx.setdefault(f"{player}|{market}", []).append(
+            {"book": book, "odds_a": oa, "odds_b": ob, "p_fair": p, "point": pt})
+        added += 1
+    return added
+
+
+def _add_af_pairs(fixture_pairs: dict, af_quotes: list[dict]) -> int:
+    """API-Football quotes carry OUR fixture name; each fixture is one answer (prop_odds_af.fetch)."""
+    by_fx: dict[tuple[str, str], list[dict]] = {}
+    for q in af_quotes or []:
+        by_fx.setdefault((str(q.get("match_date") or "")[:10], str(q.get("match") or "")), []).append(q)
+    return sum(_add_fixture_pairs(fixture_pairs, d, m, qs) for (d, m), qs in by_fx.items())
+
+
+def pairs_for_fixture(fixture_pairs: dict, match_date, match) -> dict[str, list[dict]]:
+    """The two-sided pairs quoted for THIS fixture only (same rule as prices_for_fixture)."""
+    out: dict[str, list[dict]] = {}
+    for (fd, fm), pairs in (fixture_pairs or {}).items():
+        if not _dates_close(fd, match_date) or not same_fixture(match, fm):
+            continue
+        for k, v in pairs.items():
+            out.setdefault(k, []).extend(v)
+    return out
+
+
+def _append_quotes(quotes: list[dict]) -> None:
+    """Per-book, both-sides prop quotes -> output/prop_quotes/<YYYY-MM-DD>.csv (DAY of capture).
+
+    A LOGGING HOOK ONLY (2026-10-14, owner-approved): nothing in v9 reads these files, tip prices
+    are unchanged, and player_prop_odds_history.csv keeps its exact content and schema. Distinct
+    prices only, first time seen. Never raises.
+
+    DAILY, not monthly (2026-10-22): a monthly file still reached 16 MB and was re-stored whole
+    by git on every run (75x/week). Only today's file is rewritten now; earlier days are frozen.
+    "First time seen" is checked against the previous _QUOTES_LOOKBACK_DAYS day-files (and any
+    legacy monthly file), which covers a fixture's whole pre-match quoting window."""
+    if not quotes:
+        return
+    import pandas as pd
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    df = pd.DataFrame(quotes)
+    df["snapshot_ts"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    df = df.reindex(columns=["snapshot_ts", *_QUOTE_KEY, "source"])
+    df["point"] = pd.to_numeric(df["point"], errors="coerce")
+    _QUOTES_DIR.mkdir(parents=True, exist_ok=True)
+    f = _QUOTES_DIR / f"{now:%Y-%m-%d}.csv"
+    first_day = f"{now - timedelta(days=_QUOTES_LOOKBACK_DAYS):%Y-%m-%d}"
+    seen = []
+    for p in sorted(_QUOTES_DIR.glob("*.csv")):
+        # day-files inside the lookback, plus a legacy <YYYY-MM>.csv of the current/prior month
+        if p == f or not (p.stem >= first_day or (len(p.stem) == 7 and p.stem >= first_day[:7])):
+            continue
+        try:
+            seen.append(pd.read_csv(p, usecols=lambda c: c in _QUOTE_KEY))
+        except Exception:
+            pass
+    if f.exists():
+        try:
+            df = pd.concat([pd.read_csv(f), df], ignore_index=True)
+        except Exception:
+            pass
+    df = df.drop_duplicates(subset=_QUOTE_KEY, keep="first")
+    if seen:
+        old = pd.concat(seen, ignore_index=True).reindex(columns=_QUOTE_KEY)
+        old["point"] = pd.to_numeric(old["point"], errors="coerce")
+        known = set(map(tuple, old.astype(str).itertuples(index=False, name=None)))
+        mask = [t not in known for t in
+                map(tuple, df[_QUOTE_KEY].astype(str).itertuples(index=False, name=None))]
+        df = df[mask]
+    if df.empty and not f.exists():
+        return
+    df.to_csv(f, index=False)
+
+
+def _append_odds_history(records: list[dict]) -> None:
+    """Append fetched prop odds to a permanent CSV history. Keeps every distinct
+    PRICE per real fixture (match_date+match+player+market), first time seen — so the
+    full open->close line trajectory is preserved for closing-line-value (CLV) analysis.
+    (Previously deduped per snapshot_DATE keep=last, which collapsed all intraday
+    captures into one row and made CLV untestable. Fixed 2026-06-30 for forward CLV
+    data collection — the hourly match-day predict run now logs each line move.)
+    Callers wrap this in try/except so it can never break live odds fetching."""
+    if not records:
+        return
+    import pandas as pd
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    df = pd.DataFrame(records)
+    df["snapshot_date"] = now.strftime("%Y-%m-%d")
+    df["snapshot_ts"]   = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    # `source` and `bookmaker` are carried so the two price sources can be told apart after the
+    # fact — the one thing that would otherwise be unrecoverable once the rows are merged. Rows
+    # from OddsAPI arrive without them, so they default rather than becoming NaN: 38,189 existing
+    # rows predate the second source and are all OddsAPI by definition.
+    # `player_id` (2026-11-02): the API-Football id of the tip's player, set by attach_player_ids
+    # only when the bookmaker name maps to exactly one tip player of that fixture; else empty.
+    cols = ["snapshot_date", "snapshot_ts", "match_date", "league", "match", "player", "market",
+            "odds", "source", "bookmaker", "player_id"]
+    if "source" not in df.columns:
+        df["source"] = "oddsapi"
+    else:
+        df["source"] = df["source"].fillna("oddsapi")
+    df = df.reindex(columns=cols)
+    _ODDS_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if _ODDS_HISTORY_FILE.exists():
+        try:
+            prev = pd.read_csv(_ODDS_HISTORY_FILE)
+            # Rows written before the second source existed carry no `source`. Stamped on READ
+            # as oddsapi — true by construction, since API-Football was not a price source then.
+            # Without this the dedup below (keep="first") lets the older blank-source row win and
+            # every row in the file reads as unknown provenance, which is what happened on the
+            # first attempt: 38,494 rows, all blank.
+            if "source" not in prev.columns:
+                prev["source"] = "oddsapi"
+            else:
+                prev["source"] = prev["source"].fillna("oddsapi")
+            df = pd.concat([prev, df], ignore_index=True)
+        except Exception:
+            pass
+    # Keep every distinct PRICE per real fixture (match_date disambiguates fixture-name
+    # collisions across seasons) -> preserves the open->close line trajectory for CLV.
+    df = _carry_player_ids(df)
+    df = _collapse_price_runs(df.drop_duplicates(subset=_ODDS_HISTORY_KEY, keep="first"))
+    df.to_csv(_ODDS_HISTORY_FILE, index=False)
+    # Rolling file (2026-10-22): rows of matches already played move once into
+    # player_prop_odds_history_archive/<match_date>.csv, so git stops re-storing ~60 MB per run.
+    # Upcoming matches keep their full open->close history here, so the dedup above is intact.
+    # Full-history readers use src.rolling_store.read_all. Never raises.
+    from src.rolling_store import roll
+    roll(_ODDS_HISTORY_FILE, dedupe_subset=_ODDS_HISTORY_KEY)
+
+
+_PLAYER_ROW_KEY = ["match_date", "league", "match", "player"]
+
+
+def _collapse_price_runs(df):
+    """Per book (_ODDS_BOOK_KEY), in snapshot order, keep a quote only when its price differs from
+    that book's previous quote. Every price change - including a return to an earlier price - is
+    kept, so the last row of a book is the price it last offered. Row order is preserved."""
+    import pandas as pd
+    if df.empty or "odds" not in df.columns:
+        return df
+    keys = [k for k in _ODDS_BOOK_KEY if k in df.columns]
+    ts = df["snapshot_ts"] if "snapshot_ts" in df.columns else pd.Series("", index=df.index)
+    order = (df.assign(_ts=ts.astype(str), _pos=range(len(df)))
+             .sort_values(["_ts", "_pos"], kind="stable"))
+    k = order[keys].astype(object).where(order[keys].notna(), "").astype(str).agg("|".join, axis=1)
+    prev = order["odds"].groupby(k, sort=False).shift(1)
+    keep = prev.isna() | (pd.to_numeric(order["odds"], errors="coerce")
+                          != pd.to_numeric(prev, errors="coerce"))
+    return df[df.index.isin(order.index[keep.to_numpy()])]
+
+
+def _carry_player_ids(df):
+    """Give an id-less history row the player_id another row of the SAME (match_date, league,
+    match, player) carries - that is the same quoted player in the same fixture - but only when
+    those rows carry exactly ONE id. Rows written before player_id existed gain it this way when
+    the player is re-quoted; nothing is guessed across players or fixtures."""
+    import pandas as pd
+    if df.empty or "player_id" not in df.columns:
+        return df
+    pid = pd.to_numeric(df["player_id"], errors="coerce")
+    pid = pid.where(pid > 0)
+    keyed = df[_PLAYER_ROW_KEY].astype(str).agg("|".join, axis=1)
+    ids = pd.DataFrame({"k": keyed, "pid": pid}).dropna().groupby("k")["pid"].agg(set)
+    one = {k: next(iter(v)) for k, v in ids.items() if len(v) == 1}
+    df = df.copy()
+    df["player_id"] = pid.where(pid.notna(), keyed.map(one)).astype("Int64")
+    return df
+
+
+def attach_player_ids(records: list[dict], tips_df) -> dict[str, int]:
+    """Set `player_id` on every prop-odds history record whose quoted player maps UNAMBIGUOUSLY to
+    one API-Football player among the tips of the SAME fixture (same date within a day, both clubs
+    resolved by src.team_names). OddsAPI and API-Football odds name players only, so the bridge is
+    the tip slate, which carries API-Football's player_id:
+
+      1. the normalised name equals exactly one tip player's normalised name, else
+      2. first initial + surname equals exactly one tip player's AND exactly one quoted name in
+         that fixture (the rule match_odds_to_tips prices with).
+
+    Anything else (no tip player, two candidates) leaves the record WITHOUT an id; the counts are
+    logged. Returns {"matched": n, "ambiguous": n, "unmatched": n}. Never raises on a bad row."""
+    out = {"matched": 0, "ambiguous": 0, "unmatched": 0}
+    if not records:
+        return out
+    for r in records:
+        r["player_id"] = None
+    if tips_df is None or getattr(tips_df, "empty", True) or not {"player_id", "player_name",
+                                                                  "match"} <= set(tips_df.columns):
+        out["unmatched"] = len(records)
+        print(f"[odds_fetcher] player_id: no tip slate with player ids - {len(records)} odds row(s) "
+              f"written without a player_id")
+        return out
+    date_col = next((c for c in ("date", "match_date") if c in tips_df.columns), None)
+    tips = []
+    for _, t in tips_df.iterrows():
+        try:
+            pid = int(float(t.get("player_id")))
+        except (TypeError, ValueError):
+            continue
+        if pid <= 0 or not t.get("player_name"):
+            continue
+        tips.append((str(t.get(date_col))[:10] if date_col else "", str(t.get("match")),
+                     _norm(str(t.get("player_name"))), _initial_surname(t.get("player_name")), pid))
+
+    # One candidate list per (record date, record match); the fixture test is the resolver's.
+    by_fixture: dict[tuple[str, str], list] = {}
+    quoted: dict[tuple[str, str], dict] = {}
+    for r in records:
+        fk = (str(r.get("match_date"))[:10], str(r.get("match")))
+        if fk not in by_fixture:
+            by_fixture[fk] = [t for t in tips if _dates_close(t[0], fk[0]) and same_fixture(t[1], fk[1])]
+        q = quoted.setdefault(fk, {})
+        ik = _initial_surname(r.get("player"))
+        if ik:
+            q.setdefault(ik, set()).add(_norm(str(r.get("player"))))
+    for r in records:
+        fk = (str(r.get("match_date"))[:10], str(r.get("match")))
+        cands = by_fixture[fk]
+        name = _norm(str(r.get("player")))
+        exact = {t[4] for t in cands if t[2] == name}
+        if len(exact) == 1:
+            r["player_id"] = next(iter(exact))
+            out["matched"] += 1
+            continue
+        if len(exact) > 1:
+            out["ambiguous"] += 1
+            continue
+        ik = _initial_surname(r.get("player"))
+        short = {t[4] for t in cands if ik and t[3] == ik}
+        if len(short) == 1 and len(quoted[fk].get(ik, ())) == 1:
+            r["player_id"] = next(iter(short))
+            out["matched"] += 1
+        elif short:
+            out["ambiguous"] += 1
+        else:
+            out["unmatched"] += 1
+    if out["ambiguous"] or out["unmatched"]:
+        print(f"[odds_fetcher] player_id: {out['matched']} odds row(s) tied to an API-Football "
+              f"player; {out['ambiguous']} ambiguous and {out['unmatched']} with no tip player "
+              f"in that fixture are written without a player_id")
+    return out
+
+
+def _norm(name: str) -> str:
+    """Normalize player name: lowercase, remove accents, collapse spaces."""
+    nfkd = unicodedata.normalize("NFKD", name or "")
+    ascii_name = "".join(c for c in nfkd if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", ascii_name.lower().strip())
+
+
+# Club-name resolution for matching OUR fixture names onto OddsAPI events. This used to be
+# plain equality on _norm(), which failed on every spelling variant and silently skipped the
+# event — no odds call, no data, and indistinguishable from "no bookmaker offers props".
+# Measured 2026-08-17 from prop_odds_coverage.json: 35 of 56 wanted fixtures (63%) never
+# matched, including Bundesliga 2 at 0 of 8, which would have been parked as "no coverage"
+# when in truth it was never asked. src/team_names.resolve is the same league-scoped,
+# ambiguity-refusing matcher the team model already uses.
+try:
+    _resolve_club = _pm_config._v9_src("team_names").resolve
+except Exception as _e:                                      # pragma: no cover
+    # No resolver -> no club matching at all (logged), never a raw-string fallback.
+    print(f"[odds_fetcher] team_names unavailable ({_e}); no event can be matched this run")
+    _resolve_club = None
+
+
+def _resolve_event(ev_home: str, ev_away: str,
+                   wanted: set[tuple[str, str]]) -> Optional[tuple[str, str]]:
+    """Map one OddsAPI event onto a fixture we want, or None.
+
+    `wanted` holds ORIGINAL (home, away) names for a single league, so resolution is
+    league-scoped exactly as team_names.resolve expects, and an ambiguous club is rejected
+    rather than guessed. The (home, away) pair is re-checked after resolving each side so
+    two clubs from *different* fixtures can never combine into a false match.
+    """
+    if not wanted:
+        return None
+    if _resolve_club is None:
+        return None
+
+    homes = [h for h, _ in wanted]
+    aways = [a for _, a in wanted]
+
+    rh, ra = _resolve_club(ev_home, homes), _resolve_club(ev_away, aways)
+    if rh and ra and (rh, ra) in wanted:
+        return (rh, ra)
+
+    # OddsAPI occasionally lists a tie with the sides swapped relative to our fixture.
+    rh2, ra2 = _resolve_club(ev_home, aways), _resolve_club(ev_away, homes)
+    if rh2 and ra2 and (ra2, rh2) in wanted:
+        return (ra2, rh2)
+    return None
+
+
+def _load_odds_key() -> str:
+    key = os.getenv("ODDS_API_KEY", "").strip()
+    if key:
+        return key
+    # Fallback: .api_keys file in repo root (KEY=VALUE per line)
+    root = Path(__file__).resolve().parents[1]
+    api_keys_f = root / ".api_keys"
+    if api_keys_f.exists():
+        for line in api_keys_f.read_text().splitlines():
+            if line.startswith("ODDS_API_KEY="):
+                return line.split("=", 1)[1].strip()
+    return ""
+
+
+def _get(path: str, params: dict) -> Optional[dict | list]:
+    key = _load_odds_key()
+    if not key:
+        return None
+    params["apiKey"] = key
+    r = requests.get(f"{_BASE}/{path}", params=params, timeout=15)
+    remaining = r.headers.get("x-requests-remaining", "?")
+
+    # Self-heal: if one or more requested markets aren't offered for this
+    # sport/event, OddsAPI 422s the WHOLE request. Drop the invalid market(s)
+    # named in the error and retry once so the valid markets still come back.
+    if r.status_code == 422 and params.get("markets") and "nvalid market" in r.text:
+        bad = set()
+        for grp in re.findall(r"[Ii]nvalid markets?:\s*([a-z0-9_,\s]+)", r.text):
+            bad.update(m.strip() for m in grp.split(",") if m.strip())
+        kept = [m for m in params["markets"].split(",") if m not in bad]
+        if bad and kept and len(kept) < len(params["markets"].split(",")):
+            print(f"[odds_fetcher] {path}: dropping invalid markets {sorted(bad)}, retrying with {kept}")
+            params["markets"] = ",".join(kept)
+            r = requests.get(f"{_BASE}/{path}", params=params, timeout=15)
+            remaining = r.headers.get("x-requests-remaining", "?")
+
+    if r.status_code != 200:
+        print(f"[odds_fetcher] {path}: HTTP {r.status_code} | {r.text[:120]}")
+        return None
+    print(f"[odds_fetcher] {path} OK | quota remaining: {remaining}")
+    return r.json()
+
+
+def _best_price(bookmakers: list, mkt_key: str, point: Optional[float]) -> dict[str, float]:
+    """
+    Extract best (highest) odds per player for a given market key.
+    Returns {normalized_name: best_decimal_odds}.
+    """
+    best: dict[str, float] = {}
+    for bm in bookmakers:
+        for mkt in bm.get("markets", []):
+            if mkt["key"] != mkt_key:
+                continue
+            for o in mkt.get("outcomes", []):
+                # SOT: only take Over 0.5
+                if point is not None:
+                    if o.get("name") != "Over":
+                        continue
+                    # an outcome without a line is not this line (it was read as point 999)
+                    if o.get("point") is None or abs(float(o["point"]) - point) > 0.01:
+                        continue
+                # Yes/no markets: the "No" side is the under of this bet and must never be read
+                # as the tip's price (2026-10-25: 44 OddsAPI anytime-scorer "No" quotes logged in
+                # prop_quotes 10-20..10-25 would otherwise compete for the best "Yes" price).
+                elif str(o.get("name", "")).strip().lower() == "no":
+                    continue
+                player = _norm(o.get("description", ""))
+                # No price from the provider -> no price (it was read as 0, fix9/defaults 2026-11-04)
+                price = _price(o)
+                if price is not None and price > 0:
+                    _keep_best(best, player, price)
+    return best
+
+
+def fetch_prop_odds(signals_df) -> dict[str, float]:
+    """
+    Fetch player prop odds for all matches in signals_df.
+    signals_df must have columns: league, match ('{home} vs {away}'), date.
+    Returns {"PlayerName|market": best_decimal_odds}.
+    """
+    if signals_df is None or signals_df.empty:
+        return {}
+
+    # Build set of (league, home, away) we need odds for
+    needed: dict[str, set[tuple[str, str]]] = {}  # sport_key → set of (home_norm, away_norm)
+    unmapped: dict[str, int] = {}
+    for _, row in signals_df.drop_duplicates(["league", "match"]).iterrows():
+        league = row.get("league", "")
+        sport_key = PROP_SPORT_KEYS.get(league)
+        if not sport_key:
+            # No sport key = we never ask, so these players can NEVER be priced and are
+            # AVOID by construction. On 2026-08-16 player_tips.csv carried Argentina
+            # Primera, Austrian Bundesliga, China Super League, La Liga 2 and MLS — none
+            # of them in PROP_SPORT_KEYS and none in config.PROP_LEAGUES either. They
+            # arrive via the bets.csv supplement in predict, which is not restricted to
+            # prop leagues. Surfacing the count makes that visible instead of silent.
+            unmapped[str(league)] = unmapped.get(str(league), 0) + 1
+            continue
+        parts = str(row.get("match", "")).split(" vs ")
+        if len(parts) != 2:
+            continue
+        # Keep the ORIGINAL names — _resolve_event needs them for club-name resolution.
+        needed.setdefault(sport_key, set()).add((parts[0].strip(), parts[1].strip()))
+
+    if unmapped:
+        _n = sum(unmapped.values())
+        print(f"[odds_fetcher] {_n} fixture(s) in leagues with no OddsAPI sport key — "
+              f"never asked, so their players stay AVOID by construction: "
+              f"{dict(sorted(unmapped.items(), key=lambda kv: -kv[1]))}")
+
+    if not needed:
+        return {}
+
+    result: dict[str, float] = {}
+    history_records: list[dict] = []
+    quotes: list[dict] = []          # per-book, both-sides log -> output/prop_quotes (logging only)
+    # Per-FIXTURE best prices, keyed by OUR fixture name (see _add_fixture_price). `result` above
+    # stays the old cross-fixture lookup for callers that only count it; tip pricing uses this.
+    fixture_prices: dict[tuple[str, str], dict[str, float]] = {}
+    # Per-FIXTURE real two-sided pairs (same book, same answer), for the de-vigged fair probability.
+    fixture_pairs: dict[tuple[str, str], dict[str, list[dict]]] = {}
+    # D6: the (book, capture time) of the quotes at each best price (see _LAST_FIXTURE_META)
+    fixture_meta: dict = {}
+
+    from datetime import datetime as _dt, timezone as _tz
+    today = _dt.now(_tz.utc).strftime("%Y-%m-%d")
+    cov = _load_coverage()
+
+    # Free check, so a typo can never again cost a league months of silence.
+    _verdicts = validate_sport_keys()
+    if _verdicts:
+        _unknown = [lg for lg, v in _verdicts.items() if v == "UNKNOWN_KEY"]
+        _inactive = [lg for lg, v in _verdicts.items() if v == "VALID_INACTIVE"]
+        if _unknown:
+            print(f"[odds_fetcher] BROKEN sport key(s): {_unknown}")
+        if _inactive:
+            print(f"[odds_fetcher] out of season (valid key, nothing to fetch): {_inactive}")
+
+    for sport_key, match_set in needed.items():
+        if _coverage_parked(cov, sport_key, today):
+            print(f"[odds_fetcher] {sport_key}: parked — "
+                  f"{cov[sport_key]['empty_streak']} consecutive events with no bookmaker, "
+                  f"last probed {cov[sport_key]['last_probe']}; retries every "
+                  f"{_COVERAGE_RETRY_DAYS}d")
+            continue
+
+        # Get event list (free, no quota cost)
+        events = _get(f"sports/{sport_key}/events", {})
+        if not events:
+            continue
+
+        _matched_pairs: set[tuple[str, str]] = set()
+
+        for event in events:
+            _hit = _resolve_event(event.get("home_team", ""), event.get("away_team", ""),
+                                  match_set)
+            if _hit is None:
+                continue
+            _matched_pairs.add(_hit)
+
+            event_id = event["id"]
+            cache_f = _CACHE_DIR / f"{event_id}.json"
+
+            # Cache per event — timestamp stored inside JSON (not file mtime, which GitHub
+            # Actions cache restore resets to extraction time, breaking the TTL check).
+            import time
+            bookmakers = None
+            _fetched_epoch = None                       # D6: when the answer used below was fetched
+            if cache_f.exists():
+                try:
+                    obj = json.loads(cache_f.read_text(encoding="utf-8"))
+                    if isinstance(obj, dict) and "bookmakers" in obj:
+                        ttl = (CACHE_TTL_PRICED if obj["bookmakers"]
+                               else _empty_ttl_for(event.get("commence_time", "")))
+                        # no recorded fetch time -> expired (it was age-from-epoch via a typed 0)
+                        if obj.get("fetched_at") is not None and (time.time() - obj["fetched_at"]) < ttl:
+                            bookmakers = obj["bookmakers"]
+                            _fetched_epoch = obj["fetched_at"]
+                    # Old format (plain list) — treat as expired; will re-fetch below
+                except Exception:
+                    pass
+
+            if bookmakers is None:
+                api_markets = _WC_API_MARKETS_STR if sport_key == _WC_SPORT_KEY else _API_MARKETS_STR
+                data = _get(
+                    f"sports/{sport_key}/events/{event_id}/odds",
+                    {"regions": _REGIONS, "markets": api_markets, "oddsFormat": "decimal"},
+                )
+                if data is None:
+                    continue
+                _fetched_epoch = time.time()
+                bookmakers = data.get("bookmakers", [])
+                _coverage_record(cov, sport_key, today, bool(bookmakers),
+                                 hours_to_kickoff=hours_to_kickoff(
+                                     event.get("commence_time", "")))
+                if not bookmakers:
+                    print(f"[odds_fetcher] {sport_key}: no bookmaker priced "
+                          f'{event.get("home_team","")} v {event.get("away_team","")} '
+                          f"(regions={_REGIONS})")
+                cache_f.write_text(
+                    json.dumps({"fetched_at": _fetched_epoch, "bookmakers": bookmakers}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+
+            # Extract best odds per market (+ record every price for the history)
+            _match_str  = f'{event.get("home_team", "")} vs {event.get("away_team", "")}'
+            _match_date = str(event.get("commence_time", ""))[:10]
+            _league     = SPORT_KEY_TO_LEAGUE.get(sport_key, sport_key)
+            try:
+                _ev_quotes = _quotes_from_oddsapi(bookmakers, _match_date, _league, _match_str)
+                quotes.extend(_ev_quotes)
+                # Real two-sided pairs of THIS answer, keyed by OUR fixture name like fixture_prices.
+                _add_fixture_pairs(fixture_pairs, _match_date, f"{_hit[0]} vs {_hit[1]}", _ev_quotes)
+                # D6: book + capture time of every over/yes quote, at OUR fixture name like fixture_prices
+                try:
+                    _cap = _dt.fromtimestamp(float(_fetched_epoch), _tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                except (TypeError, ValueError, OverflowError, OSError):
+                    _cap = ""
+                for _q in _ev_quotes:
+                    if str(_q.get("side") or "").lower() in ("no", "under"):
+                        continue
+                    _add_fixture_meta(fixture_meta, _match_date, f"{_hit[0]} vs {_hit[1]}", _q.get("player"),
+                                      _q.get("market"), _q.get("odds"), _q.get("bookmaker"), _cap)
+            except Exception as _qe:                         # logging must never break pricing
+                print(f"[odds_fetcher] quote log skipped for {_match_str}: {type(_qe).__name__}")
+            for our_market, (api_key, point) in _MARKET_MAP.items():
+                prices = _best_price(bookmakers, api_key, point)
+                for player_norm, price in prices.items():
+                    key = f"{player_norm}|{our_market}"
+                    _keep_best(result, key, price)
+                    # _hit is OUR (home, away) for this event, so the fixture map is keyed by the
+                    # tip's own match name rather than OddsAPI's spelling.
+                    _add_fixture_price(fixture_prices, _match_date, f"{_hit[0]} vs {_hit[1]}",
+                                       player_norm, our_market, price)
+                    history_records.append({
+                        "match_date": _match_date, "league": _league, "match": _match_str,
+                        "player": player_norm, "market": our_market, "odds": price,
+                    })
+
+        _coverage_fixtures(
+            cov, sport_key, today, len(match_set), len(_matched_pairs),
+            [f"{x} vs {y}" for x, y in sorted(match_set - _matched_pairs)][:8],
+        )
+
+    # ── SECOND SOURCE: API-Football, for the leagues OddsAPI does not sell props for ──────
+    #
+    # TWO SOURCES, ONE SET OF FILES. This fills the same `result` lookup and the same
+    # `history_records` list, so player_prop_odds_history.csv, prop_odds_coverage.json and every
+    # downstream consumer are unchanged. Same rule ARCHITECTURE.md sets for the main odds layer:
+    # sources normalise to an identical shape, parsing differences live in the client module.
+    #
+    # OddsAPI's documented soccer prop coverage is EPL, Ligue 1, Bundesliga, Serie A, La Liga and
+    # MLS — nothing else. Championship, League One, League Two and EFL Cup return zero prop books
+    # on any region while returning 36-38 books for h2h, so the markets simply are not sourced.
+    # API-Football carries them (Championship 22 prop markets, Bet365, 52 priced players on one
+    # fixture) and its daily quota sits ~74,000/75,000 unused.
+    #
+    # Runs LAST and only for leagues OddsAPI left unpriced, so the primary source keeps priority
+    # and the top five cost nothing extra.
+    try:
+        _af_added = _fill_from_api_football(signals_df, result, history_records, cov, today,
+                                            fixture_prices=fixture_prices, fixture_meta=fixture_meta)
+        if _af_added:
+            print(f"[odds_fetcher] api-football second source: +{_af_added} quote(s)")
+    except Exception as e:                                       # noqa: BLE001
+        # Never take the primary source down: a failure here must leave OddsAPI's result intact.
+        print(f"[odds_fetcher] api-football second source skipped ({type(e).__name__}: {e})")
+
+    global _LAST_PRICE_DATES, _LAST_FIXTURE_PRICES, _LAST_FIXTURE_PAIRS, _LAST_FIXTURE_META
+    _LAST_PRICE_DATES = _price_dates(history_records)
+    _LAST_FIXTURE_PRICES = fixture_prices
+    _LAST_FIXTURE_PAIRS = fixture_pairs
+    _LAST_FIXTURE_META = fixture_meta
+
+    try:
+        from player_model import prop_odds_af as _af
+        _af_quotes = _af.drain_quotes()
+        try:
+            _add_af_pairs(fixture_pairs, _af_quotes)
+        except Exception as _pe:                         # a pair failure never drops the quote log
+            print(f"[odds_fetcher] api-football two-sided pairs skipped: {type(_pe).__name__}: {_pe}")
+        quotes.extend(_af_quotes)
+        _n_pairs = sum(len(v) for fx in fixture_pairs.values() for v in fx.values())
+        print(f"[odds_fetcher] real two-sided prop prices (same book, same answer): {_n_pairs} pair(s)")
+        _append_quotes(quotes)
+        if quotes:
+            print(f"[odds_fetcher] quote log: {len(quotes)} per-book quote(s) incl. both sides")
+    except Exception as e:
+        print(f"[odds_fetcher] quote log skipped: {type(e).__name__}: {e}")
+
+    # Persist every fetched prop odd to the permanent forward-built history, each row carrying the
+    # API-Football player_id of the tip it prices where that match is unambiguous (2026-11-02).
+    try:
+        attach_player_ids(history_records, signals_df)
+        _append_odds_history(history_records)
+    except Exception as e:
+        print(f"[odds_fetcher] odds-history save skipped: {e}")
+
+    _save_coverage(cov)
+    _live = sorted(k for k, c in cov.items() if c.get("priced_events"))
+    print(f"[odds_fetcher] {len(result)} player-market prices | "
+          f"leagues with any prop coverage: {[SPORT_KEY_TO_LEAGUE.get(k, k) for k in _live] or 'none'}")
+
+    return result
+
+
+def _fill_from_api_football(signals_df, result: dict[str, float],
+                            history_records: list[dict], cov: dict, today: str,
+                            fixture_prices: Optional[dict] = None,
+                            fixture_meta: Optional[dict] = None) -> int:
+    """Top up `result` and `history_records` from API-Football. Returns quotes added.
+
+    Only touches leagues OddsAPI did NOT price. `result` keys stay in OddsAPI's normalised form
+    (`_norm(player)|market`) so `match_odds_to_tips` keeps working untouched, and a price is only
+    written when it BEATS what OddsAPI already found — the contract everywhere here is best
+    available price, and a second source must not quietly lower one.
+    """
+    import pandas as pd
+
+    from player_model import prop_odds_af as af
+
+    if signals_df is None or getattr(signals_df, "empty", True):
+        return 0
+    if "league" not in signals_df.columns or "match" not in signals_df.columns:
+        return 0
+
+    priced_by_oddsapi = {SPORT_KEY_TO_LEAGUE.get(k, k) for k, c in cov.items()
+                         if c.get("priced_events")}
+    af_leagues = af.leagues_without_oddsapi(signals_df["league"].astype(str).unique(),
+                                            priced_by_oddsapi)
+    if not af_leagues:
+        return 0
+
+    # From player_model/config.py, not the repo-root `config` imported above — see
+    # prop_odds_af._prop_leagues for why that distinction silently broke the first version.
+    seasons = af._prop_seasons()
+    ids = af._prop_leagues()
+    wanted = signals_df[signals_df["league"].astype(str).isin(af_leagues)]
+    date_col = next((c for c in ("match_date", "date") if c in wanted.columns), None)
+
+    fixtures, seen = [], set()
+    for _, row in wanted.iterrows():
+        league = str(row["league"])
+        match = str(row["match"])
+        if " vs " not in match:
+            continue
+        home, away = match.split(" vs ", 1)
+        md = str(row[date_col])[:10] if date_col else ""
+        if (league, match, md) in seen:
+            continue
+        seen.add((league, match, md))
+        lid = ids.get(league)
+        if not lid or not md:
+            continue
+        # NOT api_football.find_fixture_id: that one filters status=FT for grading settled
+        # matches, so it can never resolve a pre-match fixture. See the docstring there.
+        fid = af.find_upcoming_fixture_id(int(lid), str(seasons.get(league, "")), md, home, away)
+        if fid:
+            fixtures.append({"fixture_id": fid, "league": league, "match": match,
+                             "match_date": md})
+
+    if not fixtures:
+        print(f"[odds_fetcher] api-football: no fixture id resolved for {af_leagues}")
+        return 0
+
+    best, records = af.fetch(fixtures, verbose=False)
+    added = 0
+    for k, odd in best.items():
+        player, _, market = k.rpartition("|")
+        norm_key = f"{_norm(player)}|{market}"
+        if odd > 0 and (norm_key not in result or odd > result[norm_key]):
+            result[norm_key] = odd
+            added += 1
+    history_records.extend(records)
+    # Records carry the fixture (`match` is OUR fixture name, `match_date` the tip's date) and are
+    # over/yes only, so they rebuild prop_odds_af's `best` per fixture instead of across fixtures.
+    if fixture_prices is not None:
+        for r in records:
+            _add_fixture_price(fixture_prices, r.get("match_date", ""), r.get("match", ""),
+                               _norm(str(r.get("player", ""))), r.get("market", ""),
+                               r.get("odds"))
+    if fixture_meta is not None:                 # D6: the record's book + its answer's fetch time
+        for r in records:
+            _add_fixture_meta(fixture_meta, r.get("match_date", ""), r.get("match", ""),
+                              _norm(str(r.get("player", ""))), r.get("market", ""), r.get("odds"),
+                              r.get("bookmaker"),
+                              af.CAPTURED_AT.get((str(r.get("match_date", ""))[:10], str(r.get("match", "")))))
+
+    # Same ledger, so coverage is answered from evidence for BOTH sources. Keyed by league name
+    # rather than an OddsAPI sport key, because that is what this source is addressed by.
+    for lg in af_leagues:
+        got = sum(1 for r in records if r.get("league") == lg)
+        c = cov.setdefault(f"apifootball:{lg}", {})
+        c["league"] = lg
+        c["source"] = "api_football"
+        c["probes"] = int(c.get("probes", 0)) + 1
+        c["last_probe"] = today
+        if got:
+            c["priced_events"] = int(c.get("priced_events", 0)) + 1
+            c["last_priced"] = today
+            c["empty_streak"] = 0
+        else:
+            c["empty_streak"] = int(c.get("empty_streak", 0)) + 1
+    return added
+
+
+_TRANSLIT = str.maketrans({"ł": "l", "Ł": "L", "ø": "o", "Ø": "O", "æ": "ae", "Æ": "Ae",
+                           "ß": "ss", "đ": "d", "Đ": "D", "ı": "i"})
+
+
+def _initial_surname(name: str) -> Optional[tuple[str, str]]:
+    """('k', 'viveros') for both 'K. Viveros' and 'Kevin Viveros'. None for a one-word name —
+    mononyms ('Vitinho') are matched exactly or not at all."""
+    s = unicodedata.normalize("NFKD", str(name or "").translate(_TRANSLIT))
+    s = "".join(c for c in s if not unicodedata.combining(c)).lower()
+    toks = [t for t in re.split(r"[\s.]+", re.sub(r"[^a-z\s.'-]", "", s)) if t]
+    if len(toks) < 2:
+        return None
+    return toks[0][0], toks[-1]
+
+
+def _price_dates(history_records: list[dict]) -> dict[str, set[str]]:
+    """{'<norm player>|<market>': {match dates priced}} from one fetch's history records."""
+    out: dict[str, set[str]] = {}
+    for r in history_records:
+        out.setdefault(f"{_norm(str(r.get('player', '')))}|{r.get('market', '')}", set()).add(
+            str(r.get("match_date", ""))[:10])
+    return out
+
+
+# Filled by fetch_prop_odds so match_odds_to_tips can scope a fuzzy match to the tip's match
+# date without changing the (tips, odds_raw) signature the pipeline calls it with.
+_LAST_PRICE_DATES: dict[str, set[str]] = {}
+
+# ── FIXTURE-SCOPED PRICES (2026-10-25) ────────────────────────────────────────────────────
+# A price may only reach a tip from the tip's OWN fixture. Both sources used to collapse every
+# fixture into one {"player|market": max price} dict, so a namesake elsewhere lent his price:
+# on 2026-10-24 Matheuzinho (Vitoria v Atletico-PR, real quotes 3.85-3.90) carried 15.00 —
+# Bet365's price for the OTHER Matheuzinho in Vasco v Corinthians — and A. Marin (Girona v Celta
+# II, no SOT quote at all) took Adrian Marin's MLS 5.00 / 36.00. Filled by fetch_prop_odds:
+# {(match_date, our "home vs away"): {"<norm player>|<market>": best over/yes price}}.
+_LAST_FIXTURE_PRICES: Optional[dict[tuple[str, str], dict[str, float]]] = None
+# Filled by fetch_prop_odds: {(match_date, our "home vs away"): {"<norm player>|<market>": [pair]}},
+# the real two-sided prices match_fair_to_tips de-vigs (owner decision 2026-11-05).
+_LAST_FIXTURE_PAIRS: Optional[dict[tuple[str, str], dict[str, list[dict]]]] = None
+
+# ENTRY BOOK + CAPTURE TIME (owner 2026-11-23 "Yes, do all", D6). Beside every best price in the fixture price map:
+# the (book, capture time) of every quote AT that best price - capture time = the UTC time of the provider answer
+# that carried it (OddsAPI: the per-event call or its cache's fetched_at; API-Football: the /odds answer's cache
+# stamp). Filled by fetch_prop_odds: {(match_date, our "home vs away"): {"<norm player>|<market>":
+# {"odds": best price, "src": {(book, captured_at), ...}}}}. Read by match_meta_to_tips.
+_LAST_FIXTURE_META: Optional[dict] = None
+
+# OddsAPI dates a fixture by its UTC kickoff, the tips by theirs; allow one day of slack. A
+# different fixture can never pass, because BOTH clubs must also match.
+_FIXTURE_DATE_SLACK_DAYS = 1
+
+
+def _add_fixture_price(fixture_prices: dict, match_date, match, player_norm: str,
+                       market: str, odds) -> None:
+    """Best (highest) over/yes price per player and market, within ONE fixture."""
+    try:
+        odds = float(odds)
+    except (TypeError, ValueError):
+        return
+    if not (odds > 1.0) or not player_norm or not market or not match:
+        return
+    fx = fixture_prices.setdefault((str(match_date or "")[:10], str(match)), {})
+    _keep_best(fx, f"{player_norm}|{market}", odds)
+
+
+def _add_fixture_meta(meta: dict, match_date, match, player_norm: str, market: str, odds, book,
+                      captured_at) -> None:
+    """Track the (book, captured_at) of the quotes at the BEST over/yes price per player and market within ONE
+    fixture (the same rule as _add_fixture_price): a higher price replaces them, an equal price adds its own."""
+    try:
+        odds = float(odds)
+    except (TypeError, ValueError):
+        return
+    if not (odds > 1.0) or not player_norm or not market or not match:
+        return
+    fx = meta.setdefault((str(match_date or "")[:10], str(match)), {})
+    k = f"{player_norm}|{market}"
+    src = (str(book or "").strip(), str(captured_at or "").strip())
+    cur = fx.get(k)
+    if cur is None or odds > cur["odds"]:
+        fx[k] = {"odds": odds, "src": {src}}
+    elif odds == cur["odds"]:
+        cur["src"].add(src)
+
+
+def meta_for_fixture(fixture_meta: dict, match_date, match) -> dict:
+    """The meta of THIS fixture only (same rule as prices_for_fixture: entries naming the same fixture merge; the
+    best price wins, an equal best price unions its sources)."""
+    out: dict = {}
+    for (fd, fm), entries in (fixture_meta or {}).items():
+        if not _dates_close(fd, match_date) or not same_fixture(match, fm):
+            continue
+        for k, m in entries.items():
+            cur = out.get(k)
+            if cur is None or m["odds"] > cur["odds"]:
+                out[k] = {"odds": m["odds"], "src": set(m["src"])}
+            elif m["odds"] == cur["odds"]:
+                cur["src"] |= m["src"]
+    return out
+
+
+def entry_of(m: Optional[dict]) -> tuple[str, str]:
+    """(entry_bookmaker, entry_captured_at) of one best price's sources. Only quotes that name their book count:
+    one book -> its name; several books at the same best price -> "tie:" + the sorted names joined by ";" (any of
+    them offered it; none is singled out). Time = the earliest known capture among those quotes; '' when none is
+    known. ('', '') when no quote names a book - never guessed."""
+    if not m:
+        return "", ""
+    named = [(b, t) for b, t in m.get("src") or () if b]
+    if not named:
+        return "", ""
+    books = sorted({b for b, _t in named})
+    times = sorted(t for _b, t in named if t)
+    return (books[0] if len(books) == 1 else "tie:" + ";".join(books)), (times[0] if times else "")
+
+
+def _split_match(match) -> Optional[tuple[str, str]]:
+    parts = str(match or "").split(" vs ")
+    if len(parts) != 2:
+        return None
+    return parts[0].strip(), parts[1].strip()
+
+
+def _same_team(a: str, b: str) -> bool:
+    """Same club under two spellings (OddsAPI / API-Football / ours), decided by
+    src.team_names.resolve ONLY (Data Truth: the api_football._team_match fallback, with its
+    0.90 difflib ratio, is no longer consulted). resolve's first tier is normalised equality."""
+    if not a or not b or _resolve_club is None:
+        return False
+    return bool(_resolve_club(a, [b]))
+
+
+def same_fixture(match_a, match_b) -> bool:
+    """True when two "home vs away" strings name the same fixture (BOTH clubs must match;
+    a swapped listing is accepted, as in _resolve_event)."""
+    if str(match_a) == str(match_b):
+        return True
+    a, b = _split_match(match_a), _split_match(match_b)
+    if not a or not b:
+        return False
+    return ((_same_team(a[0], b[0]) and _same_team(a[1], b[1]))
+            or (_same_team(a[0], b[1]) and _same_team(a[1], b[0])))
+
+
+def _dates_close(a: str, b: str, days: int = _FIXTURE_DATE_SLACK_DAYS) -> bool:
+    from datetime import date
+    a, b = str(a or "")[:10], str(b or "")[:10]
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    try:
+        return abs((date.fromisoformat(a) - date.fromisoformat(b)).days) <= days
+    except ValueError:
+        return False
+
+
+def prices_for_fixture(fixture_prices: dict, match_date, match) -> dict[str, float]:
+    """The {"<norm player>|<market>": best price} quoted for THIS fixture only (empty if none).
+    Several entries can describe one fixture (two spellings of a club); their best prices merge."""
+    out: dict[str, float] = {}
+    for (fd, fm), prices in (fixture_prices or {}).items():
+        if not _dates_close(fd, match_date) or not same_fixture(match, fm):
+            continue
+        for k, v in prices.items():
+            if v > 0:
+                _keep_best(out, k, v)
+    return out
+
+
+def tip_price_key(player, market, match_date, match) -> str:
+    """Fixture-scoped key match_odds_to_tips returns and predict.enrich_with_odds reads. The
+    plain "player|market" key collided when two tips shared a name in different fixtures."""
+    return f"{player}|{market}|{str(match_date or '')[:10]}|{match}"
+
+
+def match_odds_to_tips(tips_df, odds_raw: dict[str, float],
+                       price_dates: Optional[dict[str, set[str]]] = None,
+                       fixture_prices: Optional[dict] = None) -> dict[str, float]:
+    """
+    Map fetched prices onto tips_df rows, ONLY from each tip's own fixture.
+    Returns {tip_price_key(player_name, market, date, match): odds}.
+
+    Exact normalised name first. FALLBACK (2026-10-13): first initial + surname, because the
+    tips carry API-Football's short form ('K. Viveros', 'E. Haaland') while the books use full
+    names ('kevin viveros', 'erling braut haaland') — exact-only priced 65 tips of 2,503 when
+    137 more had a price on file. The fallback is refused, never guessed, when more than one
+    priced player in that fixture and market shares the initial+surname.
+
+    FIXTURE SCOPE (2026-10-25): both lookups read only the prices quoted for the tip's own
+    fixture (same date within a day, same two clubs). A player priced only in ANOTHER fixture
+    leaves the tip unpriced. `odds_raw` and `price_dates` are kept for signature compatibility;
+    `odds_raw` has no fixture in its keys and is no longer used to price a tip. Without a
+    fixture price map nothing is priced (fail closed) rather than guessing across fixtures.
+    """
+    fixture_prices = _LAST_FIXTURE_PRICES if fixture_prices is None else fixture_prices
+    if fixture_prices is None:
+        if odds_raw:
+            print("[odds_fetcher] name match: no per-fixture price map — refusing to price "
+                  "tips from fixture-less keys")
+        return {}
+    resolved, fuzzy, refused = _resolve_tip_prices(tips_df, fixture_prices)
+    if fuzzy or refused:
+        print(f"[odds_fetcher] name match: {fuzzy} priced by initial+surname, "
+              f"{refused} refused as ambiguous")
+    return {out_key: price for out_key, (_ck, _name_key, price) in resolved.items()}
+
+
+def match_meta_to_tips(tips_df, fixture_meta: Optional[dict] = None,
+                       fixture_prices: Optional[dict] = None) -> dict[str, tuple[str, str]]:
+    """{tip_price_key: (entry_bookmaker, entry_captured_at)} for the tips match_odds_to_tips prices (same fixture
+    price map, same name rule), ONLY where the recorded sources are at exactly the price the tip is given. A tip
+    whose sources name no book is absent (blank). D6, owner 2026-11-23."""
+    fixture_prices = _LAST_FIXTURE_PRICES if fixture_prices is None else fixture_prices
+    fixture_meta = _LAST_FIXTURE_META if fixture_meta is None else fixture_meta
+    if not fixture_prices or not fixture_meta:
+        return {}
+    resolved, _f, _r = _resolve_tip_prices(tips_df, fixture_prices)
+    cache: dict = {}
+    out: dict[str, tuple[str, str]] = {}
+    for out_key, (ck, name_key, price) in resolved.items():
+        if ck not in cache:
+            cache[ck] = meta_for_fixture(fixture_meta, *ck)
+        m = cache[ck].get(name_key)
+        if m is None or m["odds"] != price:
+            continue                                   # the sources describe another price: blank
+        book, ts = entry_of(m)
+        if book:
+            out[out_key] = (book, ts)
+    return out
+
+
+def match_fair_to_tips(tips_df, fixture_pairs: Optional[dict] = None,
+                       fixture_prices: Optional[dict] = None) -> dict[str, float]:
+    """{tip_price_key: fair probability} for the tips that have a REAL two-sided price.
+
+    The tip is resolved to the SAME quoted player as its price (match_odds_to_tips' rule, on the
+    same fixture price map), then that player's pairs in the tip's own fixture are power de-vigged
+    per book and the median over books is the fair probability of the tip's side (Yes / Over).
+    A tip without a pair is absent: predict.enrich_with_odds then uses the assumed overround and
+    says so (fair_basis). Owner decision 2026-11-05."""
+    import statistics
+    fixture_prices = _LAST_FIXTURE_PRICES if fixture_prices is None else fixture_prices
+    fixture_pairs = _LAST_FIXTURE_PAIRS if fixture_pairs is None else fixture_pairs
+    if not fixture_prices or not fixture_pairs:
+        return {}
+    resolved, _f, _r = _resolve_tip_prices(tips_df, fixture_prices)
+    pair_cache: dict[tuple[str, str], dict] = {}
+    out: dict[str, float] = {}
+    for out_key, (ck, name_key, _price) in resolved.items():
+        if ck not in pair_cache:
+            pair_cache[ck] = pairs_for_fixture(fixture_pairs, *ck)
+        pairs = pair_cache[ck].get(name_key) or []
+        ps = [float(p["p_fair"]) for p in pairs if p.get("p_fair") is not None]
+        if ps:
+            out[out_key] = float(statistics.median(ps))
+    return out
+
+
+def _resolve_tip_prices(tips_df, fixture_prices: dict
+                        ) -> tuple[dict[str, tuple[tuple[str, str], str, float]], int, int]:
+    """({tip_price_key: ((tip_date, match), "<quoted norm player>|<market>", best price)},
+    n priced by initial+surname, n refused as ambiguous). The one name rule both the price and the
+    two-sided fair probability use, so they always describe the same quoted player."""
+    resolved: dict[str, tuple[tuple[str, str], str, float]] = {}
+    fixture_cache: dict[tuple[str, str], tuple[dict, dict]] = {}
+    fuzzy = refused = 0
+    for _, row in tips_df.iterrows():
+        player = row.get("player_name", "")
+        market = row.get("market", "")
+        tip_date = str(row.get("date", row.get("match_date", "")) or "")[:10]
+        match = str(row.get("match", "") or "")
+        ck = (tip_date, match)
+        if ck not in fixture_cache:
+            prices = prices_for_fixture(fixture_prices, tip_date, match)
+            index: dict[tuple, set[str]] = {}
+            for k in prices:
+                name, _, mk = k.rpartition("|")
+                key = _initial_surname(name)
+                if key:
+                    index.setdefault((key, mk), set()).add(name)
+            fixture_cache[ck] = (prices, index)
+        prices, index = fixture_cache[ck]
+        if not prices:
+            continue
+        out_key = tip_price_key(player, market, tip_date, match)
+        key_norm = f"{_norm(player)}|{market}"
+        if key_norm in prices:
+            resolved[out_key] = (ck, key_norm, prices[key_norm])
+            continue
+        key = _initial_surname(player)
+        if not key:
+            continue
+        cands = index.get((key, market), set())
+        if len(cands) == 1:
+            name_key = f"{next(iter(cands))}|{market}"
+            resolved[out_key] = (ck, name_key, prices[name_key])
+            fuzzy += 1
+        elif len(cands) > 1:
+            refused += 1
+    return resolved, fuzzy, refused
