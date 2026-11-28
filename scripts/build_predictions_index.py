@@ -39,6 +39,11 @@ API-Football kickoff as the authoritative one, club spellings unified by src.tea
 kickoff_utc and team names stay as they are). The counts of matches the old page key split - per kind (accent,
 name variant, kickoff drift) and per league - and every kickoff disagreement go to
 reports/dashboard/fixture_identity.json (a data-truth finding, never silently picked).
+
+Which sources were read goes to reports/dashboard/predictions_sources.json (owner 2026-11-28): Pro READ, or
+UNAVAILABLE with the reason (source blocked: PRO_REPO_AVAILABLE=0, src/pro_source.py; or its ledger was not
+readable this run). The page then says Pro is unavailable instead of showing no Pro rows as if none were made.
+Deterministic (no wall-clock value), like the index.
 """
 from __future__ import annotations
 
@@ -62,6 +67,7 @@ OUT_DIR = ROOT / "reports" / "dashboard"
 INDEX_NAME = "predictions_index.parquet"
 SUMMARY_NAME = "predictions_summary.csv"
 IDENTITY_NAME = "fixture_identity.json"
+SOURCES_NAME = "predictions_sources.json"
 CLEAN_CFG = ROOT / "config" / "trustworthy_performance.json"
 
 #: Repos the public page may show. v11 is private (wowza-exec) and is never read here.
@@ -290,8 +296,17 @@ def identity_doc(rows: pd.DataFrame, ident: pd.DataFrame) -> dict:
     return {**rep, "kickoff_disagreements": drift}
 
 
+def sources_doc(pro_root: Path | None, pro_reason: str | None = None) -> dict:
+    """Per public repo: READ, or UNAVAILABLE with why (never an empty Pro section that looks like 'no predictions')."""
+    pro = ({"status": "READ"} if pro_root is not None else
+           {"status": "UNAVAILABLE", "reason": pro_reason or "Pro ledger not read this run"})
+    return {"about": "Sources of predictions_index.parquet / predictions_summary.csv. UNAVAILABLE = not read this "
+                     "run: that repo's rows are missing from both files, not zero.",
+            "sources": {"v9": {"status": "READ"}, "pro": pro}}
+
+
 def run(*, v9_root: Path = ROOT, pro_root: Path | None = None, out_dir: Path = OUT_DIR,
-        clean_cfg: Path = CLEAN_CFG) -> dict:
+        clean_cfg: Path = CLEAN_CFG, pro_reason: str | None = None) -> dict:
     frames = []
     for r in [Path(v9_root)] + ([Path(pro_root)] if pro_root else []):
         d = load(r / "output" / "prediction_ledger", r / "output" / "prediction_ledger_settled")
@@ -310,7 +325,10 @@ def run(*, v9_root: Path = ROOT, pro_root: Path | None = None, out_dir: Path = O
     idoc = identity_doc(rows, ident)
     (out_dir / IDENTITY_NAME).write_text(json.dumps(idoc, indent=1, ensure_ascii=False) + "\n", encoding="utf-8",
                                          newline="\n")
+    sdoc = sources_doc(pro_root, pro_reason)
+    (out_dir / SOURCES_NAME).write_text(json.dumps(sdoc, indent=1) + "\n", encoding="utf-8", newline="\n")
     return {"rows": int(len(index)), "repos": sorted(index["repo"].astype(str).unique()),
+            "pro_source": sdoc["sources"]["pro"]["status"],
             "summary_rows": int(len(summary)), "settled_questions": int(summary["settled"].sum()),
             "index_bytes": (out_dir / INDEX_NAME).stat().st_size,
             "matches_split_before": idoc["matches_split_before"], "page_keys_before": idoc["page_keys_before"],
@@ -323,10 +341,16 @@ def main(argv=None) -> int:
                     help="checkout of NevixAA/wowzaV9-Pro (output/prediction_ledger[_settled]/pro)")
     ap.add_argument("--out-dir", type=Path, default=OUT_DIR)
     a = ap.parse_args(argv)
-    pro = a.pro_root if a.pro_root and (a.pro_root / "output" / "prediction_ledger").exists() else None
-    if a.pro_root and pro is None:
-        print(f"::warning::Pro ledger not found under {a.pro_root} - index holds v9 only")
-    print(json.dumps(run(pro_root=pro, out_dir=a.out_dir)))
+    from src import pro_source
+    if not pro_source.available():
+        pro, reason = None, pro_source.REASON
+        pro_source.notice("Pro prediction ledger")
+    else:
+        pro = a.pro_root if a.pro_root and (a.pro_root / "output" / "prediction_ledger").exists() else None
+        reason = None if pro is not None else ("Pro ledger not readable this run" if a.pro_root else "no --pro-root given")
+        if a.pro_root and pro is None:
+            print(f"::warning::Pro ledger not found under {a.pro_root} - index holds v9 only, Pro marked UNAVAILABLE")
+    print(json.dumps(run(pro_root=pro, out_dir=a.out_dir, pro_reason=reason)))
     return 0
 
 

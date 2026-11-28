@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HEALTH = ROOT / "output" / "system_health.json"
 MANIFEST = ROOT / "output" / "artifact_manifest.json"
 
-STALE_WORDS = ("STALE", "UNKNOWN", "MISSING")
+STALE_WORDS = ("STALE", "UNKNOWN", "MISSING", "UNAVAILABLE")
 STALE_LABEL = "STALE — NOT VALID FOR CURRENT DECISIONS"
 STATUS_ICON = {"GREEN": "🟢 GREEN", "AMBER": "🟡 AMBER", "RED": "🔴 RED", "NO_DATA": "⚪ NO_DATA",
                "OK": "🟢 OK", "EMPTY": "⚪ EMPTY", "TAMPERED": "🔴 TAMPERED"}

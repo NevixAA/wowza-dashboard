@@ -3,6 +3,8 @@
 Reads the small output/artifact_manifest.json written by src/artifact_freshness.py (never file mtime).
 A decision-facing artifact that is STALE / UNKNOWN / MISSING gets a red banner instead of being shown
 like current truth; a dated study shows its date; a historical record says it is historical.
+UNAVAILABLE (owner 2026-11-28: its source repo is blocked, src/pro_source.py) is a red banner too, and
+any verdict this module does not know is treated as stale - only FRESH is ever shown as fresh.
 """
 from __future__ import annotations
 
@@ -32,12 +34,14 @@ def banner(st, rel: str, label: str | None = None, m: dict | None = None) -> dic
     r = status(rel, m)
     name = label or rel
     f = r.get("freshness")
-    if f in ("STALE", "UNKNOWN", "MISSING"):
-        st.error(f"**STALE — NOT VALID FOR CURRENT PERFORMANCE DECISIONS** · {name}: {r.get('reason', '')}")
+    if f == "UNAVAILABLE":
+        st.error(f"**UNAVAILABLE — SOURCE BLOCKED, NOT VALID FOR CURRENT DECISIONS** · {name}: {r.get('reason', '')}")
     elif f == "HISTORICAL":
         st.warning(f"**HISTORICAL RECORD** · {name}: {r.get('reason', '')}")
     elif f == "DATED_STUDY":
         st.info(f"**Study as of {str(r.get('generated_at') or '?')[:10]}** · {name} — evidence of that date, not live.")
+    elif f != "FRESH":
+        st.error(f"**STALE — NOT VALID FOR CURRENT PERFORMANCE DECISIONS** · {name}: {r.get('reason', '')}")
     else:
         st.caption(f"✅ {name}: fresh (generated {r.get('generated_at')}, limit {r.get('max_age_hours')} h)")
     return r
@@ -61,12 +65,12 @@ def recorded(st, rel: str, generated_at, max_age_hours: float, label: str | None
              m: dict | None = None) -> str:
     """Freshness for an artifact: the manifest's verdict when the manifest tracks it, otherwise the
     age of the timestamp RECORDED inside the artifact against `max_age_hours`. An unknown age is
-    treated as stale. Returns FRESH | STALE | HISTORICAL | DATED_STUDY | UNKNOWN."""
+    treated as stale (UNAVAILABLE too). Returns FRESH | STALE | HISTORICAL | DATED_STUDY | UNKNOWN."""
     m = m or manifest()
     if any(r.get("artifact") == rel for r in m.get("artifacts", [])):
         r = banner(st, rel, label, m)
         f = r.get("freshness") or "UNKNOWN"
-        return "STALE" if f in ("STALE", "UNKNOWN", "MISSING") else f
+        return f if f in ("FRESH", "HISTORICAL", "DATED_STUDY") else "STALE"     # UNAVAILABLE included
     name = label or rel
     a = age_hours(generated_at)
     if a is None or a > max_age_hours:
@@ -89,12 +93,14 @@ def header_badge(rel: str, label: str | None = None, m: dict | None = None) -> t
     f = r.get("freshness") or "UNKNOWN"
     name = label or rel
     gen = str(r.get("generated_at") or "?")[:16].replace("T", " ")
-    if f in ("STALE", "UNKNOWN", "MISSING"):
-        return "STALE", ui.freshness_badge("STALE", f"{name} · NOT VALID FOR DECISIONS")
+    if f == "UNAVAILABLE":
+        return "STALE", ui.freshness_badge("STALE", f"{name} · UNAVAILABLE (source blocked) · NOT VALID FOR DECISIONS")
     if f == "HISTORICAL":
         return f, ui.freshness_badge("HISTORICAL", name)
     if f == "DATED_STUDY":
         return f, ui.freshness_badge("DATED_STUDY", f"{name} · as of {gen[:10]}")
+    if f != "FRESH":
+        return "STALE", ui.freshness_badge("STALE", f"{name} · NOT VALID FOR DECISIONS")
     lim = r.get("max_age_hours")
     return "FRESH", ui.freshness_badge("FRESH", f"{name} · generated {gen} UTC" + (f" · limit {lim} h" if lim else ""))
 

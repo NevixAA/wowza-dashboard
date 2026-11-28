@@ -483,8 +483,27 @@ def props_image(today: str, freeze: bool = False, cutoff=None) -> list[bytes]:
                         footer="Times UTC · no-stake leagues excluded · not betting advice")
 
 
+def _pro_blocked(rel: str) -> bool:
+    """True while Pro is unavailable (PRO_REPO_AVAILABLE=0, src/pro_source.py): no copy is read, local or remote,
+    so a stale local checkout can never be shown as current. The album caption says the Pro sections are missing."""
+    from src import pro_source
+    if pro_source.available():
+        return False
+    pro_source.notice(f"[daily_pack] Pro {rel}")
+    return True
+
+
+def pro_unavailable_line() -> str:
+    """Caption line while Pro is unavailable: its sections are missing, not empty."""
+    from src import pro_source
+    return "" if pro_source.available() else ("\nPro sections (1X2, Bet Builder, Pro scoreboard, weekly top picks) "
+                                              "unavailable - source blocked.")
+
+
 def _pro_csv(rel: str) -> pd.DataFrame:
-    """A Pro output, from a sibling checkout or Pro's public repo. Empty on any failure."""
+    """A Pro output, from a sibling checkout or Pro's public repo. Empty on any failure or while Pro is unavailable."""
+    if _pro_blocked(rel):
+        return pd.DataFrame()
     try:
         for base in (os.getenv("PRO_LOCAL"), "../pro", "../wowzaV9-Pro"):
             if base and os.path.exists(os.path.join(base, rel)):
@@ -829,6 +848,8 @@ PRO_SCOREBOARD_URL = ("https://raw.githubusercontent.com/NevixAA/wowzaV9-Pro/mai
 
 def _pro_scoreboard() -> dict:
     import json
+    if _pro_blocked("output/tip_scoreboard.json"):
+        return {}
     for p in (os.getenv("PRO_LOCAL"), "../wowzaV9-Pro", "../pro", "../v10"):
         if p:
             f = os.path.join(p, "output", "tip_scoreboard.json")
@@ -935,6 +956,8 @@ PRO_BET_BUILDER_URL = ("https://raw.githubusercontent.com/NevixAA/wowzaV9-Pro/ma
 def _pro_bet_builder() -> pd.DataFrame:
     """Pro's daily Bet Builder selection (Pro src/combo/notify.daily_selection): local sibling
     checkout if present, else the public repo - the same source as the scoreboard above."""
+    if _pro_blocked("output/bet_builder_daily.csv"):
+        return pd.DataFrame()
     for p in (os.getenv("PRO_LOCAL"), "../wowzaV9-Pro", "../pro", "../v10"):
         if p:
             f = os.path.join(p, "output", "bet_builder_daily.csv")
@@ -1271,6 +1294,8 @@ def props_model_check_image(today: str, weeks: int = 8) -> list[bytes]:
 
 def _pro_csv(rel: str) -> pd.DataFrame:
     """A Pro output CSV: local sibling checkout if present, else the public repo (as the scoreboard)."""
+    if _pro_blocked(rel):
+        return pd.DataFrame()
     for p in (os.getenv("PRO_LOCAL"), "../wowzaV9-Pro", "../pro", "../v10"):
         if p and os.path.exists(os.path.join(p, rel)):
             return pd.read_csv(os.path.join(p, rel))
@@ -1428,7 +1453,7 @@ def send_weekly_pack() -> bool:
         except Exception as e:                                          # noqa: BLE001
             print(f"[weekly_pack] {name} skipped: {type(e).__name__}: {e}")
     print("[weekly_pack] " + ", ".join(notes))
-    if not pngs or not send_album(token, chat_id, pngs, f"📅 <b>Wowza weekly — week {wk}</b>"):
+    if not pngs or not send_album(token, chat_id, pngs, f"📅 <b>Wowza weekly — week {wk}</b>" + pro_unavailable_line()):
         return False
     notified.add(key)
     _save_notified(notified)
@@ -1509,7 +1534,7 @@ def build_pack(now: _dt.datetime | None = None, freeze: bool = False) -> tuple[l
     caption = (f"☀️ <b>Wowza daily — {header}{tag}</b>{late_line}\n"
                f"Top picks · today's tips ({n_tips}) · yesterday's results (team + props) · record · player props · 1X2 · "
                f"Bet Builder · sharp moves · Pro scoreboard"
-               + (f"\nYesterday's top picks: {yline}" if yline else ""))
+               + (f"\nYesterday's top picks: {yline}" if yline else "") + pro_unavailable_line())
     print("[daily_pack] " + ", ".join(notes))
     return pngs, caption
 

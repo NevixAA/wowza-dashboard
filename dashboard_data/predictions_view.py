@@ -16,6 +16,7 @@ from src.model_releases import Releases
 ROOT = Path(__file__).resolve().parents[1]
 INDEX = ROOT / "reports" / "dashboard" / "predictions_index.parquet"
 SUMMARY = ROOT / "reports" / "dashboard" / "predictions_summary.csv"
+SOURCES = ROOT / "reports" / "dashboard" / "predictions_sources.json"
 
 LEDGER_ONLY_LABEL = "ledger only — no tips"
 
@@ -106,6 +107,19 @@ def serving_rows(rows: pd.DataFrame) -> pd.DataFrame:
 
 def load_summary(path: Path | None = None) -> pd.DataFrame:
     return pd.read_csv(path or SUMMARY, dtype={"line": str})
+
+
+def pro_source_status(path: Path | None = None) -> tuple[str, str]:
+    """(status, reason) of the Pro source in the last index build (scripts/build_predictions_index.py writes
+    predictions_sources.json). READ | UNAVAILABLE | UNKNOWN (file missing / unreadable: never assumed READ)."""
+    import json
+    try:
+        doc = json.loads(Path(path or SOURCES).read_text(encoding="utf-8"))
+        pro = (doc.get("sources") or {}).get("pro") or {}
+    except (OSError, ValueError):
+        return "UNKNOWN", "Pro source status not recorded"
+    st = str(pro.get("status") or "UNKNOWN")
+    return st, str(pro.get("reason") or ("" if st == "READ" else "Pro source status not recorded"))
 
 
 def league_options(idx: pd.DataFrame) -> dict[str, str]:

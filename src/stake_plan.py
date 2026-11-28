@@ -138,8 +138,14 @@ PRO_RATINGS = "output/studies/league_ratings.json"
 def load_league_ratings(max_age_days: float = 8.0) -> dict:
     """Pro's league ratings 1-10 (src/studies/league_results.py). Fail closed: missing, unreadable or
     older than max_age_days -> {} (no league is rated, so NO league is staked - bankroll_policy gives an
-    unrated league no stake since 2026-11-01). Every such case is logged. Recorded timestamp, never mtime."""
+    unrated league no stake since 2026-11-01). Every such case is logged. Recorded timestamp, never mtime.
+    Pro source blocked (PRO_REPO_AVAILABLE=0, src/pro_source.py) -> {} without reading any copy, local or remote."""
     import json
+    from src import pro_source
+    if not pro_source.available():
+        pro_source.notice("league ratings (" + PRO_RATINGS + ")")
+        log.warning(f"league ratings UNAVAILABLE ({pro_source.REASON}) - no league is rated, so no tip gets a stake")
+        return {}
     try:
         j = None
         for p in (os.getenv("PRO_LOCAL"), "../pro", "../wowzaV9-Pro"):

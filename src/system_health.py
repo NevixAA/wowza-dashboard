@@ -158,8 +158,11 @@ def stale_artifacts(manifest: dict) -> dict:
     return _c("Stale artifacts", st, f"{n} stale", rule, ", ".join(manifest.get("stale_decision_facing", [])))
 
 
-def forward_progress(prog: dict) -> dict:
+def forward_progress(prog: dict, pro_available: bool = True) -> dict:
     rule = "GREEN if the frozen forward evaluator ran within 48 h; AMBER within 7 days; RED older/missing (progress itself is informational)"
+    if not pro_available:
+        from src import pro_source
+        return _c("Forward candidate progress", RED, "UNAVAILABLE - " + pro_source.REASON, rule)
     if not prog:
         return _c("Forward candidate progress", RED, "no progress file", rule)
     age = (pd.Timestamp.now(tz="UTC") - pd.Timestamp(prog["generated_at"])).total_seconds() / 3600
@@ -183,6 +186,9 @@ def workflow_health(wh: dict) -> dict:
     st = RED if n >= 3 else AMBER if (n >= 1 or age > 36) else GREEN
     sup = wh.get("superseded_failures_24h")
     val = f"{n} still failing / {wh.get('runs_24h')} runs (24 h)" + (f" · {sup} fixed since" if sup else "")
+    if wh.get("unavailable_repos"):                 # a blocked repo is not read: say so, never imply it is clean
+        st = AMBER if st == GREEN else st
+        val += " · NOT READ (source blocked): " + ", ".join(r.split("/")[-1] for r in wh["unavailable_repos"])
     return _c("GitHub workflow health", st, val, rule,
               "; ".join(f"{f['repo']}: {f['workflow']}" for f in wh.get("failures", [])[:5]))
 
@@ -282,9 +288,11 @@ def evaluate(now: datetime | None = None) -> list[dict]:
     plan = _csv(OUT / "stake_plan.csv")
     policy = _json(ROOT / "config" / "bankroll_policy.json")
     shadow = _csv(OUT / "v91_shadow.csv", dtype={"result": str, "close_status": str})
+    from src import pro_source
+    pro_ok = pro_source.available()
     pro = Path(os.getenv("PRO_LOCAL") or (ROOT.parent / "pro"))
-    prog = _json(pro / "output" / "edge_reassessment" / "candidate_forward_progress.json")
-    if not prog:
+    prog = _json(pro / "output" / "edge_reassessment" / "candidate_forward_progress.json") if pro_ok else {}
+    if pro_ok and not prog:
         try:
             from dashboard_data.pro import _f                          # HTTP fallback when no Pro checkout
             from dashboard_data.core import read_json
@@ -294,7 +302,7 @@ def evaluate(now: datetime | None = None) -> list[dict]:
     return [side_routing(plan, policy), stake_mapping(plan),
             shadow_settlement(_json(OUT / "shadow_settlement_health.json")),
             challenger_coverage(shadow, now), certified_clv(shadow, _json(OUT / "clv_collection_health.json")),
-            stale_artifacts(_json(OUT / "artifact_manifest.json")), forward_progress(prog),
+            stale_artifacts(_json(OUT / "artifact_manifest.json")), forward_progress(prog, pro_ok),
             workflow_health(_json(OUT / "workflow_health.json")), fantasy_status(_json(OUT / "fantasy_v2_summary.json")),
             weekly_research_panel(_json(ROOT / "config" / "league_market_regimes.json"), _research_lock_status(),
                                   _json(OUT / "league_market_health.json"), now)]
@@ -726,21 +734,29 @@ def record_workflows() -> dict:
     tok = os.getenv("GITHUB_TOKEN", "")
     hdr = {"Authorization": f"Bearer {tok}"} if tok else {}
     since = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    by_repo = {}
+    from src import pro_source
+    by_repo, unavailable = {}, []
     for repo in REPOS:
+        if repo == pro_source.REPO and not pro_source.available():
+            unavailable.append(repo)                # blocked: not read, and never counted as "0 failures"
+            continue
         by_repo[repo] = []
         for page in range(1, 11):          # >100 runs/day is normal here; one page undercounted
             r = requests.get(f"https://api.github.com/repos/{repo}/actions/runs",
                              params={"per_page": 100, "page": page, "created": f">{since}"},
                              headers=hdr, timeout=30).json()
-            batch = r.get("workflow_runs", [])
+            if "workflow_runs" not in r:             # 403 / 404 / blocked: unread, not "no failures"
+                unavailable.append(repo)
+                break
+            batch = r["workflow_runs"]
             by_repo[repo] += batch
             if len(batch) < 100:
                 break
     fails, superseded = still_failing(by_repo)
     out = {"generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
            "runs_24h": sum(len(v) for v in by_repo.values()),
-           "failures_24h": len(fails), "failures": fails, "superseded_failures_24h": superseded}
+           "failures_24h": len(fails), "failures": fails, "superseded_failures_24h": superseded,
+           "unavailable_repos": unavailable}
     (OUT / "workflow_health.json").write_text(json.dumps(out, indent=1), encoding="utf-8")
     return out
 

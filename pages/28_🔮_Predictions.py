@@ -31,6 +31,10 @@ ui.page_header("Predictions",
                "record, not bets: nothing here is a tip or a stake, and no price is shown.",
                eyebrow_text="Performance · prediction ledger", state="LEARNING")
 st.caption("Sources: the v9 and Pro prediction ledgers and their settled views. v11: private.")
+PRO_STATUS, PRO_REASON = V.pro_source_status()
+if PRO_STATUS != "READ":
+    st.error(f"**Pro: {PRO_STATUS}** · {PRO_REASON}. Pro's rows are missing from this page and its record, "
+             "not zero - nothing is shown in their place.")
 
 
 @st.cache_resource(ttl=300, show_spinner=False)
@@ -125,6 +129,9 @@ else:
     for tab, (title, models) in zip(tabs, V.FAMILIES):
         with tab:
             fam = rows[rows["model_id"].isin(models)]
+            if fam.empty and models[0].startswith("pro_") and PRO_STATUS != "READ":
+                ui.empty_state("NOT_CONNECTED", f"Pro {PRO_STATUS}: {PRO_REASON}. Not measured - not 'no prediction'.")
+                continue
             if fam.empty:
                 ui.empty_state("NO_DATA", f"No {title.lower()} prediction for this match"
                                           + (" (Pro's grid and combos cover Pro's own leagues)."
