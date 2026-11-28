@@ -122,6 +122,20 @@ def pro_source_status(path: Path | None = None) -> tuple[str, str]:
     return st, str(pro.get("reason") or ("" if st == "READ" else "Pro source status not recorded"))
 
 
+def pro_read_from(path: Path | None = None) -> str:
+    """'' or where Pro was read in the last index build, e.g. 'server via exec · produced 2026-11-28T18:07:42Z ·
+    ledger as of 2026-11-28T17:55:52Z' (PRO_SOURCE=exec, src/pro_source.py)."""
+    import json
+    try:
+        pro = (json.loads(Path(path or SOURCES).read_text(encoding="utf-8")).get("sources") or {}).get("pro") or {}
+    except (OSError, ValueError):
+        return ""
+    if pro.get("status") != "READ" or not pro.get("from"):
+        return ""
+    return " · ".join([str(pro["from"])] + [f"{lbl} {pro[k]}" for k, lbl in (("produced_at", "produced"),
+                                                                           ("as_of", "ledger as of")) if pro.get(k)])
+
+
 def league_options(idx: pd.DataFrame) -> dict[str, str]:
     """league_slug -> display name; ledger-only leagues say so."""
     lo = idx.groupby("league_slug")["ledger_only"].any()

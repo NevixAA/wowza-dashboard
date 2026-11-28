@@ -129,14 +129,21 @@ def newest_date(df: pd.DataFrame, *cols: str):
 # (v10/src/data/v9_source.py). This is the same pattern pointed the other way: when a sibling
 # checkout is absent, fetch the file from GitHub instead. Local always wins when present, so a
 # developer sees their working tree and never a stale copy of it.
+#
+# Pro (owner 2026-11-28): GitHub blocked NevixAA/wowzaV9-Pro on 2026-11-27, so its raw URL is dead. Pro's outputs
+# are produced on the owner's server and published to the PRIVATE repo NevixAA/wowza-exec, branch pro-outputs
+# (src/pro_source.py). Without a local checkout the dashboard reads them there, server-side, with the read-only
+# Streamlit secret PRICE_STORE_RO_TOKEN (dashboard_data/private_prices.py). Only files the server's manifest
+# lists as PUBLISHED are read, and only while the manifest is fresh; otherwise Pro is "could not be reached".
 RAW_BASE = {
-    "pro": "https://raw.githubusercontent.com/NevixAA/wowzaV9-Pro/main",
     "v11": "https://raw.githubusercontent.com/NevixAA/wowza_v11/main",
 }
 API_BASE = {
-    "pro": "https://api.github.com/repos/NevixAA/wowzaV9-Pro",
     "v11": "https://api.github.com/repos/NevixAA/wowza_v11",
 }
+#: repos read from the private exec store instead of raw HTTP: repo -> (store repo, branch)
+EXEC_BASE = {"pro": ("NevixAA/wowza-exec", "pro-outputs")}
+_EXEC_MANIFEST: dict = {}       # repo -> (fetched_at, manifest | None, why)
 
 #: Downloads land here. raw.githubusercontent rate-limits unauthenticated requests, so a fetched
 #: file is reused for this long rather than re-pulled on every Streamlit rerun — and a rerun
@@ -164,6 +171,8 @@ def resolve_file(repo: str, rel: str) -> Path | None:
     if local is not None:
         p = local / rel
         return p if p.exists() else None
+    if repo in EXEC_BASE:
+        return _exec_file(repo, rel)
     base = RAW_BASE.get(repo)
     if not base:
         return None
@@ -207,6 +216,10 @@ def remote_listing(repo: str, rel_dir: str) -> list[str]:
     if local is not None:
         d = local / rel_dir
         return sorted(x.name for x in d.iterdir()) if d.exists() else []
+    if repo in EXEC_BASE:                # the server's manifest lists every published file
+        man = exec_manifest(repo)[0] or {}
+        pre = rel_dir.rstrip("/") + "/"
+        return sorted({f[len(pre):].split("/", 1)[0] for f in (man.get("files") or {}) if f.startswith(pre)})
     base = API_BASE.get(repo)
     if not base:
         return []
@@ -235,4 +248,69 @@ def reachable(repo: str) -> bool:
     """True when the repo can be read at all — checked out locally OR fetchable over HTTP."""
     if repo_path(repo) is not None:
         return True
+    if repo in EXEC_BASE:
+        return exec_manifest(repo)[0] is not None
     return repo in RAW_BASE
+
+
+def exec_manifest(repo: str = "pro") -> tuple[dict | None, str]:
+    """(manifest, why) of a repo published to the private exec store. None + why when the token is missing, the
+    store cannot be read, or the manifest is older than src.pro_source.MANIFEST_MAX_AGE_H (never shown as current).
+    Memoised for _EXEC_TTL_SECONDS so a Streamlit rerun does not re-ask GitHub."""
+    import time
+    from src import pro_source
+    hit = _EXEC_MANIFEST.get(repo)
+    if hit and time.time() - hit[0] < _EXEC_TTL_SECONDS:
+        man, why = hit[1], hit[2]
+    else:
+        man, why = None, ""
+        try:
+            from dashboard_data import private_prices as PP
+            store, ref = EXEC_BASE[repo]
+            man = json.loads(PP.get(pro_source.MANIFEST, repo=store, ref=ref).decode("utf-8"))
+        except Exception as e:                                         # noqa: BLE001 - message is token-free
+            man, why = None, f"Pro server copy not readable ({e})"
+        _EXEC_MANIFEST[repo] = (time.time(), man, why)
+    if man is None:
+        return None, why
+    ok, w, _ = pro_source.exec_status(now=_now(), man=man)
+    return (man, "") if ok else (None, w)
+
+
+_EXEC_TTL_SECONDS = 10 * 60
+
+
+def exec_unreachable_reason(repo: str = "pro") -> str:
+    return exec_manifest(repo)[1]
+
+
+def _exec_file(repo: str, rel: str) -> Path | None:
+    """One published file of the exec copy, cached on disk for _REMOTE_TTL_SECONDS. Only a file the fresh manifest
+    lists as PUBLISHED is fetched, and the bytes must match its sha256; anything else -> None."""
+    import hashlib
+    import time
+    man, _ = exec_manifest(repo)
+    if man is None:
+        return None
+    from src import pro_source
+    meta = (man.get("files") or {}).get(rel)
+    if not meta or not pro_source.exec_status(rel, now=_now(), man=man)[0]:
+        return None
+    cached = _cache_path(f"{repo}_exec", rel)
+    if cached.exists() and hashlib.sha256(cached.read_bytes()).hexdigest() == meta.get("sha256"):
+        return cached
+    if time.time() - _MISSING.get((f"{repo}_exec", rel), -1e9) < _REMOTE_TTL_SECONDS:
+        return None
+    try:
+        from dashboard_data import private_prices as PP
+        store, ref = EXEC_BASE[repo]
+        body = PP.get(rel, repo=store, ref=ref)
+    except Exception:                                                  # noqa: BLE001
+        _MISSING[(f"{repo}_exec", rel)] = time.time()
+        return None
+    if hashlib.sha256(body).hexdigest() != meta.get("sha256"):
+        _MISSING[(f"{repo}_exec", rel)] = time.time()
+        return None
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    cached.write_bytes(body)
+    return cached

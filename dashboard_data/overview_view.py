@@ -31,7 +31,7 @@ ROLE = {
 
 # ── speed: overlap Pro's sequential directory listings (same calls, same memo) ─────────────────────
 def prefetch_pro_listings(max_workers: int = 8) -> None:
-    if core.repo_path("pro") is not None or "pro" not in core.API_BASE:
+    if core.repo_path("pro") is not None or "pro" not in core.API_BASE:   # exec copy: listings come from its manifest
         return                                   # local checkout: listings are instant already
     seasons = sorted((n for n in core.remote_listing("pro", "data") if n.startswith("season_")), reverse=True)
     if not seasons:

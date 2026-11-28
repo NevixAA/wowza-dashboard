@@ -23,9 +23,11 @@ def _f(rel: str):
 
 
 def absent_reason() -> str:
+    from dashboard_data.core import exec_unreachable_reason
+    why = exec_unreachable_reason("pro")
     return ("Pro could not be reached — no local checkout at ../wowzaV9-Pro or ../v10, and the "
-            "public repo did not respond. The dashboard shows what it can reach rather than "
-            "failing.")
+            "server copy (private store wowza-exec, branch pro-outputs) could not be read"
+            + (f": {why}" if why else "") + ". The dashboard shows what it can reach rather than failing.")
 
 
 def system_contract() -> dict:
@@ -55,7 +57,7 @@ def canonical_stores() -> dict:
     if not seasons:
         return {"available": False,
                 "why": absent_reason() if not reachable("pro")
-                       else "Pro is reachable but has no data/season_* store"}
+                       else "Pro is reachable but no data/season_* store is published to it (the server copy carries outputs only)"}
     latest = seasons[0]
     stores: dict[str, dict] = {}
     # Listing every store's partitions costs one API call per store when remote, so the store

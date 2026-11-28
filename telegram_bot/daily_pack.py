@@ -484,30 +484,53 @@ def props_image(today: str, freeze: bool = False, cutoff=None) -> list[bytes]:
 
 
 def _pro_blocked(rel: str) -> bool:
-    """True while Pro is unavailable (PRO_REPO_AVAILABLE=0, src/pro_source.py): no copy is read, local or remote,
-    so a stale local checkout can never be shown as current. The album caption says the Pro sections are missing."""
+    """True while Pro is unavailable (src/pro_source.py: PRO_SOURCE none, or github with PRO_REPO_AVAILABLE=0):
+    no copy is read, local or remote, so a stale local checkout can never be shown as current. The album caption
+    says the Pro sections are missing. (PRO_SOURCE=exec is checked per file in _pro_file.)"""
     from src import pro_source
-    if pro_source.available():
+    if pro_source.source() == "exec" or pro_source.available():
         return False
     pro_source.notice(f"[daily_pack] Pro {rel}")
     return True
 
 
-def pro_unavailable_line() -> str:
-    """Caption line while Pro is unavailable: its sections are missing, not empty."""
+#: per-file freshness limit (hours) when Pro is read from the server copy (PRO_SOURCE=exec)
+#: every Pro file the pack reads, with its own limit - a file not listed here is never read (KeyError, fail closed)
+PRO_MAX_AGE_H = {"output/paper_1x2.csv": 36, "output/bet_builder_daily.csv": 36, "output/tip_scoreboard.json": 36,
+                 "output/studies/top_picks_weekly.csv": 8 * 24}
+
+
+def _pro_file(rel: str, legacy=("../pro", "../wowzaV9-Pro", "../v10")):
+    """(kind, path) for one Pro output (src.pro_source.locate): 'path' read it, 'legacy' try GitHub as before,
+    'none' unavailable (a notice was printed)."""
+    import os
     from src import pro_source
+    return pro_source.locate(rel, (os.getenv("PRO_LOCAL"),) + tuple(legacy), PRO_MAX_AGE_H[rel],
+                             f"[daily_pack] Pro {rel}")
+
+
+def pro_unavailable_line() -> str:
+    """Caption line while a Pro section cannot be read: its sections are missing, not empty."""
+    from src import pro_source
+    if pro_source.source() == "exec":
+        miss = [r for r, lim in PRO_MAX_AGE_H.items() if not pro_source.exec_status(r, lim)[0]]
+        return "" if not miss else ("\nPro sections (1X2, Bet Builder, Pro scoreboard, weekly top picks) "
+                                    "unavailable - not current on the Pro server.")
     return "" if pro_source.available() else ("\nPro sections (1X2, Bet Builder, Pro scoreboard, weekly top picks) "
                                               "unavailable - source blocked.")
 
 
 def _pro_csv(rel: str) -> pd.DataFrame:
-    """A Pro output, from a sibling checkout or Pro's public repo. Empty on any failure or while Pro is unavailable."""
+    """A Pro output, from the server copy (PRO_SOURCE=exec), a sibling checkout or Pro's public repo. Empty on any
+    failure or while Pro is unavailable."""
     if _pro_blocked(rel):
         return pd.DataFrame()
     try:
-        for base in (os.getenv("PRO_LOCAL"), "../pro", "../wowzaV9-Pro"):
-            if base and os.path.exists(os.path.join(base, rel)):
-                return pd.read_csv(os.path.join(base, rel), low_memory=False)
+        kind, path = _pro_file(rel)
+        if kind == "none":
+            return pd.DataFrame()
+        if kind == "path":
+            return pd.read_csv(path, low_memory=False)
         return pd.read_csv("https://raw.githubusercontent.com/NevixAA/wowzaV9-Pro/main/" + rel, low_memory=False)
     except Exception as e:                                              # noqa: BLE001
         print(f"[daily_pack] {rel} unavailable: {type(e).__name__}")
@@ -848,14 +871,15 @@ PRO_SCOREBOARD_URL = ("https://raw.githubusercontent.com/NevixAA/wowzaV9-Pro/mai
 
 def _pro_scoreboard() -> dict:
     import json
-    if _pro_blocked("output/tip_scoreboard.json"):
+    rel = "output/tip_scoreboard.json"
+    if _pro_blocked(rel):
         return {}
-    for p in (os.getenv("PRO_LOCAL"), "../wowzaV9-Pro", "../pro", "../v10"):
-        if p:
-            f = os.path.join(p, "output", "tip_scoreboard.json")
-            if os.path.exists(f):
-                with open(f, encoding="utf-8") as fh:
-                    return json.load(fh)
+    kind, path = _pro_file(rel, ("../wowzaV9-Pro", "../pro", "../v10"))
+    if kind == "none":
+        return {}
+    if kind == "path":
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
     try:
         import requests
         r = requests.get(PRO_SCOREBOARD_URL, timeout=20)
@@ -954,15 +978,16 @@ PRO_BET_BUILDER_URL = ("https://raw.githubusercontent.com/NevixAA/wowzaV9-Pro/ma
 
 
 def _pro_bet_builder() -> pd.DataFrame:
-    """Pro's daily Bet Builder selection (Pro src/combo/notify.daily_selection): local sibling
-    checkout if present, else the public repo - the same source as the scoreboard above."""
-    if _pro_blocked("output/bet_builder_daily.csv"):
+    """Pro's daily Bet Builder selection (Pro src/combo/notify.daily_selection): the server copy (PRO_SOURCE=exec),
+    a local sibling checkout, else the public repo - the same source as the scoreboard above."""
+    rel = "output/bet_builder_daily.csv"
+    if _pro_blocked(rel):
         return pd.DataFrame()
-    for p in (os.getenv("PRO_LOCAL"), "../wowzaV9-Pro", "../pro", "../v10"):
-        if p:
-            f = os.path.join(p, "output", "bet_builder_daily.csv")
-            if os.path.exists(f):
-                return pd.read_csv(f)
+    kind, path = _pro_file(rel, ("../wowzaV9-Pro", "../pro", "../v10"))
+    if kind == "none":
+        return pd.DataFrame()
+    if kind == "path":
+        return pd.read_csv(path)
     try:
         return pd.read_csv(PRO_BET_BUILDER_URL)
     except Exception:                                                   # noqa: BLE001
@@ -1293,12 +1318,14 @@ def props_model_check_image(today: str, weeks: int = 8) -> list[bytes]:
 
 
 def _pro_csv(rel: str) -> pd.DataFrame:
-    """A Pro output CSV: local sibling checkout if present, else the public repo (as the scoreboard)."""
+    """A Pro output CSV: the server copy (PRO_SOURCE=exec), a local sibling checkout, else the public repo."""
     if _pro_blocked(rel):
         return pd.DataFrame()
-    for p in (os.getenv("PRO_LOCAL"), "../wowzaV9-Pro", "../pro", "../v10"):
-        if p and os.path.exists(os.path.join(p, rel)):
-            return pd.read_csv(os.path.join(p, rel))
+    kind, path = _pro_file(rel, ("../wowzaV9-Pro", "../pro", "../v10"))
+    if kind == "none":
+        return pd.DataFrame()
+    if kind == "path":
+        return pd.read_csv(path)
     try:
         return pd.read_csv("https://raw.githubusercontent.com/NevixAA/wowzaV9-Pro/main/" + rel)
     except Exception:                                                   # noqa: BLE001

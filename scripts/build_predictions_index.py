@@ -296,9 +296,10 @@ def identity_doc(rows: pd.DataFrame, ident: pd.DataFrame) -> dict:
     return {**rep, "kickoff_disagreements": drift}
 
 
-def sources_doc(pro_root: Path | None, pro_reason: str | None = None) -> dict:
-    """Per public repo: READ, or UNAVAILABLE with why (never an empty Pro section that looks like 'no predictions')."""
-    pro = ({"status": "READ"} if pro_root is not None else
+def sources_doc(pro_root: Path | None, pro_reason: str | None = None, pro_from: dict | None = None) -> dict:
+    """Per public repo: READ, or UNAVAILABLE with why (never an empty Pro section that looks like 'no predictions').
+    pro_from (PRO_SOURCE=exec): where Pro was read - {"from": "server via exec", "produced_at": ..., "as_of": ...}."""
+    pro = ({"status": "READ", **(pro_from or {})} if pro_root is not None else
            {"status": "UNAVAILABLE", "reason": pro_reason or "Pro ledger not read this run"})
     return {"about": "Sources of predictions_index.parquet / predictions_summary.csv. UNAVAILABLE = not read this "
                      "run: that repo's rows are missing from both files, not zero.",
@@ -306,7 +307,7 @@ def sources_doc(pro_root: Path | None, pro_reason: str | None = None) -> dict:
 
 
 def run(*, v9_root: Path = ROOT, pro_root: Path | None = None, out_dir: Path = OUT_DIR,
-        clean_cfg: Path = CLEAN_CFG, pro_reason: str | None = None) -> dict:
+        clean_cfg: Path = CLEAN_CFG, pro_reason: str | None = None, pro_from: dict | None = None) -> dict:
     frames = []
     for r in [Path(v9_root)] + ([Path(pro_root)] if pro_root else []):
         d = load(r / "output" / "prediction_ledger", r / "output" / "prediction_ledger_settled")
@@ -325,7 +326,7 @@ def run(*, v9_root: Path = ROOT, pro_root: Path | None = None, out_dir: Path = O
     idoc = identity_doc(rows, ident)
     (out_dir / IDENTITY_NAME).write_text(json.dumps(idoc, indent=1, ensure_ascii=False) + "\n", encoding="utf-8",
                                          newline="\n")
-    sdoc = sources_doc(pro_root, pro_reason)
+    sdoc = sources_doc(pro_root, pro_reason, pro_from)
     (out_dir / SOURCES_NAME).write_text(json.dumps(sdoc, indent=1) + "\n", encoding="utf-8", newline="\n")
     return {"rows": int(len(index)), "repos": sorted(index["repo"].astype(str).unique()),
             "pro_source": sdoc["sources"]["pro"]["status"],
@@ -342,15 +343,8 @@ def main(argv=None) -> int:
     ap.add_argument("--out-dir", type=Path, default=OUT_DIR)
     a = ap.parse_args(argv)
     from src import pro_source
-    if not pro_source.available():
-        pro, reason = None, pro_source.REASON
-        pro_source.notice("Pro prediction ledger")
-    else:
-        pro = a.pro_root if a.pro_root and (a.pro_root / "output" / "prediction_ledger").exists() else None
-        reason = None if pro is not None else ("Pro ledger not readable this run" if a.pro_root else "no --pro-root given")
-        if a.pro_root and pro is None:
-            print(f"::warning::Pro ledger not found under {a.pro_root} - index holds v9 only, Pro marked UNAVAILABLE")
-    print(json.dumps(run(pro_root=pro, out_dir=a.out_dir, pro_reason=reason)))
+    pro, reason, read_from = pro_source.ledger_root(a.pro_root)     # PRO_SOURCE github | exec | none
+    print(json.dumps(run(pro_root=pro, out_dir=a.out_dir, pro_reason=reason, pro_from=read_from)))
     return 0
 
 

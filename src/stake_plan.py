@@ -139,19 +139,21 @@ def load_league_ratings(max_age_days: float = 8.0) -> dict:
     """Pro's league ratings 1-10 (src/studies/league_results.py). Fail closed: missing, unreadable or
     older than max_age_days -> {} (no league is rated, so NO league is staked - bankroll_policy gives an
     unrated league no stake since 2026-11-01). Every such case is logged. Recorded timestamp, never mtime.
-    Pro source blocked (PRO_REPO_AVAILABLE=0, src/pro_source.py) -> {} without reading any copy, local or remote."""
+    Pro source unavailable (src/pro_source.py: PRO_SOURCE none, github with PRO_REPO_AVAILABLE=0, or exec while
+    the server copy does not publish a CURRENT ratings file - the studies are off, so it is withheld) -> {} without
+    reading any copy, local or remote."""
     import json
     from src import pro_source
-    if not pro_source.available():
-        pro_source.notice("league ratings (" + PRO_RATINGS + ")")
-        log.warning(f"league ratings UNAVAILABLE ({pro_source.REASON}) - no league is rated, so no tip gets a stake")
+    kind, path = pro_source.locate(PRO_RATINGS, (os.getenv("PRO_LOCAL"), "../pro", "../wowzaV9-Pro"),
+                                   max_age_days * 24, "league ratings (" + PRO_RATINGS + ")")
+    if kind == "none":
+        log.warning(f"league ratings UNAVAILABLE ({pro_source.reason() or 'not published'}) - no league is rated, "
+                    f"so no tip gets a stake")
         return {}
     try:
         j = None
-        for p in (os.getenv("PRO_LOCAL"), "../pro", "../wowzaV9-Pro"):
-            if p and os.path.exists(os.path.join(p, PRO_RATINGS)):
-                j = json.loads(open(os.path.join(p, PRO_RATINGS), encoding="utf-8").read())
-                break
+        if kind == "path":
+            j = json.loads(open(path, encoding="utf-8").read())
         if j is None:
             import requests
             r = requests.get("https://raw.githubusercontent.com/NevixAA/wowzaV9-Pro/main/" + PRO_RATINGS, timeout=20)
@@ -318,6 +320,8 @@ def write(bets: pd.DataFrame | None, side_bets: pd.DataFrame | None,
                          prior_directions=prior)
                 for _, g in sel.groupby("date")] if len(sel) else []
         plan = pd.concat(days, ignore_index=True) if days else size_day(sel, policy, bankroll=bankroll, peak=bankroll)
+        if plan.empty:      # an empty plan keeps the selection columns (date, side, ...) a non-empty plan has
+            plan = plan.reindex(columns=list(dict.fromkeys(list(sel.columns) + list(plan.columns))))
         for problem in health_check(plan, policy):
             log.error(f"STAKE PLAN HEALTH: {problem}")
         plan["bankroll_basis"] = BASIS

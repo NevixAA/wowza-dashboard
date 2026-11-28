@@ -162,7 +162,9 @@ def forward_progress(prog: dict, pro_available: bool = True) -> dict:
     rule = "GREEN if the frozen forward evaluator ran within 48 h; AMBER within 7 days; RED older/missing (progress itself is informational)"
     if not pro_available:
         from src import pro_source
-        return _c("Forward candidate progress", RED, "UNAVAILABLE - " + pro_source.REASON, rule)
+        return _c("Forward candidate progress", RED, "UNAVAILABLE - " + (
+            pro_source.exec_status("output/edge_reassessment/candidate_forward_progress.json")[1]
+            if pro_source.source() == "exec" else pro_source.reason() or pro_source.REASON), rule)
     if not prog:
         return _c("Forward candidate progress", RED, "no progress file", rule)
     age = (pd.Timestamp.now(tz="UTC") - pd.Timestamp(prog["generated_at"])).total_seconds() / 3600
@@ -289,10 +291,16 @@ def evaluate(now: datetime | None = None) -> list[dict]:
     policy = _json(ROOT / "config" / "bankroll_policy.json")
     shadow = _csv(OUT / "v91_shadow.csv", dtype={"result": str, "close_status": str})
     from src import pro_source
-    pro_ok = pro_source.available()
-    pro = Path(os.getenv("PRO_LOCAL") or (ROOT.parent / "pro"))
-    prog = _json(pro / "output" / "edge_reassessment" / "candidate_forward_progress.json") if pro_ok else {}
-    if pro_ok and not prog:
+    rel = "output/edge_reassessment/candidate_forward_progress.json"
+    if pro_source.source() == "exec":      # server copy: only a file the server publishes as current (studies are off)
+        p = pro_source.exec_path(rel, None, "Forward candidate progress")
+        pro_ok = p is not None
+        prog = _json(p) if p is not None else {}
+    else:
+        pro_ok = pro_source.available()
+        pro = Path(os.getenv("PRO_LOCAL") or (ROOT.parent / "pro"))
+        prog = _json(pro / rel) if pro_ok else {}
+    if pro_ok and not prog and pro_source.source() == "github":
         try:
             from dashboard_data.pro import _f                          # HTTP fallback when no Pro checkout
             from dashboard_data.core import read_json
@@ -737,8 +745,8 @@ def record_workflows() -> dict:
     from src import pro_source
     by_repo, unavailable = {}, []
     for repo in REPOS:
-        if repo == pro_source.REPO and not pro_source.available():
-            unavailable.append(repo)                # blocked: not read, and never counted as "0 failures"
+        if repo == pro_source.REPO and (pro_source.source() != "github" or not pro_source.available()):
+            unavailable.append(repo)                # blocked (Pro now runs on the server): not read, never "0 failures"
             continue
         by_repo[repo] = []
         for page in range(1, 11):          # >100 runs/day is normal here; one page undercounted

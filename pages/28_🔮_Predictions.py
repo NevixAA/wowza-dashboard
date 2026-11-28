@@ -32,6 +32,8 @@ ui.page_header("Predictions",
                eyebrow_text="Performance · prediction ledger", state="LEARNING")
 st.caption("Sources: the v9 and Pro prediction ledgers and their settled views. v11: private.")
 PRO_STATUS, PRO_REASON = V.pro_source_status()
+if PRO_STATUS == "READ" and V.pro_read_from():
+    st.caption(f"Pro: READ · {V.pro_read_from()} (UTC)")
 if PRO_STATUS != "READ":
     st.error(f"**Pro: {PRO_STATUS}** · {PRO_REASON}. Pro's rows are missing from this page and its record, "
              "not zero - nothing is shown in their place.")
