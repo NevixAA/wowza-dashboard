@@ -56,6 +56,13 @@ BET_SELECTION_COLUMNS = ("date", "league", "home_team", "away_team", "model_type
 THRESHOLD_MARKET = {"OU25": "ou25", "BTTS": "btts", "OVER15": "over15", "OVER35": "over35"}
 
 
+#: selections() output columns. An empty run keeps them: a header-less empty frame made size_day write a
+#: stake_plan.csv with no date/side columns (predict 2026-11-28 16:52, zero tips), and every reader of
+#: `date` crashed (main red run 46169597728).
+SELECTION_OUT_COLUMNS = ("date", "fixture", "league", "model_type", "market", "side", "signal_tier", "odds",
+                         "league_threshold_evidence")
+
+
 class SelectionSchemaError(ValueError):
     """Side selections do not satisfy SIDE_SELECTION_COLUMNS (missing column, model_type or odds)."""
 
@@ -204,6 +211,8 @@ def selections(bets: pd.DataFrame | None, side_bets: pd.DataFrame | None) -> pd.
                          "model_type": str(r.model_type), "market": m, "side": str(r.side),
                          "signal_tier": r.signal_tier, "odds": r.odds})
     d = pd.DataFrame(rows)
+    if d.empty:
+        return pd.DataFrame(columns=list(SELECTION_OUT_COLUMNS))
     if not d.empty:
         d["odds"] = pd.to_numeric(d["odds"], errors="coerce")
         # NO GLOBAL-THRESHOLD STAKES (owner 2026-11-01: "every league should be special thresholds").
@@ -239,8 +248,11 @@ def attach_shadow(plan: pd.DataFrame, shadow: pd.DataFrame | None) -> pd.DataFra
     """Plan + trailing shadow columns. Existing columns, their order and every value are untouched;
     a plan row with no shadow match gets NaN (never an invented number). Never raises."""
     try:
-        if plan is None or plan.empty:
+        if plan is None:
             return plan
+        if plan.empty:                                               # zero tips: same header, no rows
+            return plan.reindex(columns=list(plan.columns) + [c for c in SHADOW_PLAN_COLS
+                                                              if c not in plan.columns])
         out = plan.copy()
         out["selection_engine_version"] = "legacy_raw_edge"         # the engine that MADE these tips
         cols = [c for c in SHADOW_PLAN_COLS if c != "selection_engine_version"]

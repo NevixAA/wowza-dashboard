@@ -131,7 +131,10 @@ try:
     sp = pd.read_csv(_sp_path) if _sp_path.exists() else pd.DataFrame()
 except Exception:                                                    # noqa: BLE001
     sp = pd.DataFrame()
-if sp.empty:
+if sp.empty and _sp_path.exists() and len(sp.columns):
+    # predict ran and sized zero tips: an honest zero, not a missing file
+    ui.empty_state("NO_DATA", "The last predict run sized 0 tips — `output/stake_plan.csv` holds no current tip.")
+elif sp.empty:
     ui.empty_state("NO_DATA", "No stake plan yet — predict writes `output/stake_plan.csv` on its next run.")
 else:
     show, by_day = V.plan_rows(sp)

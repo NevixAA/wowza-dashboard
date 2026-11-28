@@ -1,8 +1,8 @@
 {
- "built_at_utc": "2026-11-28T19:44:10Z",
- "v9_commit_of_manifest": "e3468097ef3addc9064ee499c78c3ffe186ce6d2",
- "v9_head_at_build": "ba4f53d6e64283f561ea04023a5b5d668dbf6499",
- "dashboard_build_id": "858f39bce39896a4",
+ "built_at_utc": "2026-11-28T20:40:37Z",
+ "v9_commit_of_manifest": "79f1a515958b346dc471e9b51382fc2da8b905f3",
+ "v9_head_at_build": "09c51d85f9928b65e4daea0d3dfb50737e3e7e27",
+ "dashboard_build_id": "3ba22d4b68670b20",
  "schema_version": 1,
  "code_files": 218,
  "data_files_mirrored": 140
